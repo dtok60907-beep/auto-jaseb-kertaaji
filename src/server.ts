@@ -218,7 +218,15 @@ function notifyLpmStatus(store: Store, target: LpmTarget) {
   const text = ({ PENDING_APPROVAL: `@${target.username} menunggu persetujuan.`, READY: `@${target.username} siap dipakai.`, UNAVAILABLE: `@${target.username} tidak bisa dipakai.`, REMOVED: `@${target.username} dihapus.` } as Partial<Record<LpmTargetStatus, string>>)[target.status];
   if (text) void bot.api.sendMessage(buyer.telegramId, text).catch(() => undefined);
 }
-function syncCommentTargets(store: Store, buyerId: string, bases: string[]) { const wanted = new Set(bases.map((item) => item.replace(/^@/, "").toLowerCase())); store.commentTargets = store.commentTargets.filter((item) => item.buyerId !== buyerId || wanted.has(item.base.toLowerCase())); for (const base of wanted) if (!store.commentTargets.some((item) => item.buyerId === buyerId && item.base.toLowerCase() === base)) store.commentTargets.push({ id: id("base"), buyerId, base, status: "CHECKING", updatedAt: now() }); }
+function syncCommentTargets(store: Store, buyerId: string, bases: string[]) {
+  const wanted = new Set(bases.map((item) => item.replace(/^@/, "").toLowerCase()));
+  store.commentTargets = store.commentTargets.filter((item) => item.buyerId !== buyerId || wanted.has(item.base.toLowerCase()));
+  for (const base of wanted) {
+    const current = store.commentTargets.find((item) => item.buyerId === buyerId && item.base.toLowerCase() === base);
+    if (!current) store.commentTargets.push({ id: id("base"), buyerId, base, status: "CHECKING", updatedAt: now() });
+    else if (current.status === "MUTED" || current.status === "UNAVAILABLE") { current.status = "CHECKING"; delete current.note; current.updatedAt = now(); }
+  }
+}
 function sendBuyerAlert(store: Store, buyerId: string, title: string, detail: string, link?: string) { const buyer = store.buyers.find((item) => item.id === buyerId); if (!buyer?.telegramId || !bot) return; const text = [title, detail, link ? `Buka pesan: ${link}` : ""].filter(Boolean).join("\n"); void bot.api.sendMessage(buyer.telegramId, text).catch(() => undefined); }
 function previewText(value: string) { return value.replace(/\s+/g, " ").trim().slice(0, 900) || "(Post tanpa teks)"; }
 function sendApprovalAlert(store: Store, candidate: Candidate) { const buyer = store.buyers.find((item) => item.id === candidate.buyerId); if (!buyer?.telegramId || !bot) return; const text = [`Lead baru · @${candidate.base}`, "", "Post yang cocok:", candidate.preview, "", "Komentar yang akan dikirim:", candidate.wording, candidate.link ? `Link post MF: ${candidate.link}` : ""].filter(Boolean).join("\n"); const keyboard = new InlineKeyboard().text("✅ Tepat", `cm:g:${candidate.id}`).text("🚫 OOT", `cm:b:${candidate.id}`); void bot.api.sendMessage(buyer.telegramId, text, { reply_markup: keyboard, link_preview_options: { is_disabled: true } }).catch(() => undefined); }
@@ -794,9 +802,10 @@ app.post<{ Body: { buyerId?: string; base?: string; messageId?: string; link?: s
     const store = await load(); cleanup(store); const buyer = store.buyers.find((item) => item.id === targetBuyer); const config = store.commentConfigs.find((item) => item.buyerId === targetBuyer);
     if (!buyer?.commentActive || !hasPlanAccess(store, buyer, "COMMENT") || !config || !buyer.commentAccountConnected) return { action: "ignored", reason: "comment_off_or_not_ready" };
     const baseAllowed = config.bases.some((item) => item.replace(/^@/, "").toLowerCase() === base.toLowerCase());
+    const targetReady = store.commentTargets.some((item) => item.buyerId === targetBuyer && item.base.toLowerCase() === base.toLowerCase() && item.status === "READY");
     const division = config.divisions.map((item) => ({ ...item, hits: item.keywords.filter((word) => matchTerm(word, text)).length, blocked: item.blacklist.some((word) => matchTerm(word, text)) })).filter((item) => item.hits > 0 && !item.blocked).sort((a, b) => b.hits - a.hits)[0];
     const duplicate = store.dedupe.some((item) => item.buyerId === targetBuyer && item.base === base && item.messageId === messageId);
-    if (!baseAllowed || !division || duplicate) return { action: "ignored", reason: !baseAllowed ? "base_not_selected" : duplicate ? "duplicate" : "keyword_miss" };
+    if (!baseAllowed || !targetReady || !division || duplicate) return { action: "ignored", reason: !baseAllowed ? "base_not_selected" : !targetReady ? "target_not_ready" : duplicate ? "duplicate" : "keyword_miss" };
     store.dedupe.push({ buyerId: targetBuyer, base, messageId, at: now() });
     if (config.mode === "APPROVAL") {
       const candidate: Candidate = { id: id("lead"), buyerId: targetBuyer, base, messageId, link: String(body.link ?? ""), wording: division.wording, preview: previewText(sourceText), createdAt: now() };
