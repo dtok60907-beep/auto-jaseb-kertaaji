@@ -13,7 +13,8 @@ import { loadPersistentStore, readEncryptedSessions, removeEncryptedSession, sav
 type Product = "ADMIN_BROADCAST" | "USERBOT_PROMO" | "LEGACY_BUNDLE";
 type Plan = "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT";
 type Executor = "ADMIN" | "BUYER";
-type Buyer = { id: string; name: string; telegramId: string; broadcastActive: boolean; userBroadcastActive?: boolean; commentActive: boolean; commentAccountConnected: boolean; planBroadcast: boolean; planUserBroadcast?: boolean; planComment: boolean; legacyBundle?: boolean; workerId: string | null; updatedAt: string; broadcastEditingBy?: CommentActor; broadcastEditingUntil?: string; userBroadcastEditingBy?: CommentActor; userBroadcastEditingUntil?: string };
+type UserbotAccountStatus = "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "RECONNECT_REQUIRED";
+type Buyer = { id: string; name: string; telegramId: string; broadcastActive: boolean; userBroadcastActive?: boolean; commentActive: boolean; commentAccountConnected: boolean; userbotAccountStatus?: UserbotAccountStatus; userbotAccountIssue?: string; userbotLastSeenAt?: string; planBroadcast: boolean; planUserBroadcast?: boolean; planComment: boolean; legacyBundle?: boolean; workerId: string | null; updatedAt: string; broadcastEditingBy?: CommentActor; broadcastEditingUntil?: string; userBroadcastEditingBy?: CommentActor; userBroadcastEditingUntil?: string };
 type Worker = { id: string; label: string; username: string; status: "AVAILABLE" | "ASSIGNED" | "COOLDOWN" | "DISABLED"; buyerId: string | null; cooldownUntil?: string; createdAt: string };
 type ForwardSource = { channel: string; messageId: number; showSource: boolean };
 type Broadcast = { buyerId: string; executor?: Executor; wording: string; mode: "TEXT" | "FORWARD"; forward?: ForwardSource; groups: string[]; intervalMinutes: number; updatedBy: "ADMIN" | "BUYER"; updatedAt: string; nextSendAt?: string; lastSentAt?: string; lastGroup?: string; groupCursor?: number; deliveryToken?: string; deliveryUntil?: string };
@@ -102,7 +103,16 @@ function scheduleRunnerReconcile(delay = 5_000) { if (shuttingDown || runnerReco
 function terminateRunner(runner: ChildProcess | undefined) { if (!runner || runner.exitCode !== null) return; try { if (runner.pid) process.kill(-runner.pid, "SIGTERM"); else runner.kill(); } catch { runner.kill(); } }
 function startWorkerRunner(workerId: string) { if (shuttingDown || workerRunners.get(workerId)?.exitCode === null) return; const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/lpm-runner.ts"), workerId], { cwd: join(root, ".."), env: process.env, stdio: "ignore", detached: true }); workerRunners.set(workerId, runner); runner.on("exit", () => { workerRunners.delete(workerId); scheduleRunnerReconcile(); }); runner.unref(); }
 function stopWorkerRunner(workerId: string) { terminateRunner(workerRunners.get(workerId)); workerRunners.delete(workerId); }
-function startCommentRunner(buyerId: string) { if (shuttingDown || commentRunners.get(buyerId)?.exitCode === null) return; const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/comment-runner.ts"), buyerId], { cwd: join(root, ".."), env: process.env, stdio: "ignore", detached: true }); commentRunners.set(buyerId, runner); runner.on("exit", () => { commentRunners.delete(buyerId); scheduleRunnerReconcile(); }); runner.unref(); }
+function startCommentRunner(buyerId: string) {
+  if (shuttingDown || commentRunners.get(buyerId)?.exitCode === null) return;
+  const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/comment-runner.ts"), buyerId], { cwd: join(root, ".."), env: process.env, stdio: ["ignore", "ignore", "pipe"], detached: true });
+  let stderr = "";
+  runner.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-1_200); });
+  commentRunners.set(buyerId, runner);
+  runner.on("error", (error) => app.log.error({ err: error, buyerId }, "Could not start userbot runner"));
+  runner.on("exit", (code, signal) => { commentRunners.delete(buyerId); if (!shuttingDown && code && code !== 0) app.log.warn({ buyerId, code, signal, stderr: stderr.trim().slice(-500) }, "Userbot runner stopped; reconciliation will decide whether to restart it"); scheduleRunnerReconcile(); });
+  runner.unref();
+}
 function stopCommentRunner(buyerId: string) { terminateRunner(commentRunners.get(buyerId)); commentRunners.delete(buyerId); }
 
 const defaultPackages = (): Package[] => [];
@@ -128,6 +138,7 @@ async function load(): Promise<Store> {
   ready.commentJobs = ready.commentJobs.map((item: any) => ({ ...item, preview: String(item.preview ?? "") }));
   for (const buyer of ready.buyers) {
     buyer.planUserBroadcast ??= false; buyer.userBroadcastActive ??= false;
+    buyer.userbotAccountStatus ??= buyer.commentAccountConnected ? "CONNECTED" : "DISCONNECTED";
     const oldPlans = ready.subscriptions.filter((item) => item.buyerId === buyer.id && !item.product);
     if (oldPlans.some((item) => item.plan === "BROADCAST") && oldPlans.some((item) => item.plan === "COMMENT")) buyer.legacyBundle = true;
   }
@@ -305,7 +316,7 @@ function cleanup(store: Store) {
     if (!ownsSubscription) continue;
     if (!hasPlanAccess(store, buyer, "BROADCAST")) { buyer.planBroadcast = false; buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); }
     if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) { buyer.planUserBroadcast = false; buyer.userBroadcastActive = false; const broadcast = broadcastFor(store, buyer.id, "BUYER"); if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
-    if (!hasPlanAccess(store, buyer, "COMMENT")) { buyer.planComment = false; buyer.commentActive = false; if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) buyer.commentAccountConnected = false; }
+    if (!hasPlanAccess(store, buyer, "COMMENT")) { buyer.planComment = false; buyer.commentActive = false; if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) { buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "DISCONNECTED"; delete buyer.userbotAccountIssue; } }
   }
   const expiredBuyerIds = new Set(store.buyers.filter((buyer) => !hasPlanAccess(store, buyer, "COMMENT") && !hasPlanAccess(store, buyer, "USERBOT_BROADCAST")).map((buyer) => buyer.id));
   for (const job of store.commentJobs) if (expiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
@@ -482,8 +493,10 @@ app.post<{ Body: { feature: "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT"; activ
     const broadcast = broadcastFor(store, buyer.id, "BUYER");
     if (broadcast) { if (req.body.active) scheduleNextBroadcast(broadcast, true); else { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
   } else {
-    const ready = hasPlanAccess(store, buyer, "COMMENT") && buyer.commentAccountConnected && store.commentConfigs.some((item) => item.buyerId === buyer.id);
-    if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: "Hubungkan akun dan lengkapi setup Auto Komen dulu." });
+    const configured = store.commentConfigs.some((item) => item.buyerId === buyer.id);
+    const targetReady = store.commentTargets.some((item) => item.buyerId === buyer.id && item.status === "READY");
+    const ready = hasPlanAccess(store, buyer, "COMMENT") && buyer.commentAccountConnected && configured && targetReady;
+    if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: !buyer.commentAccountConnected ? "Hubungkan akun Telegram lo dulu." : !configured ? "Lengkapi setup Auto Komen dulu." : "Menunggu base siap dipakai." });
     buyer.commentActive = req.body.active;
   }
   buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
@@ -691,8 +704,41 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/worker-owner", { 
 app.post<{ Body: { buyerId?: string; base?: string; discussion?: string; status?: CommentTargetStatus; note?: string } }>("/api/internal/comment-target-status", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const buyerId = String(req.body?.buyerId ?? ""); const base = String(req.body?.base ?? "").replace(/^@/, "").toLowerCase(); const next = req.body?.status; const allowed: CommentTargetStatus[] = ["CHECKING", "READY", "PENDING_APPROVAL", "UNAVAILABLE", "MUTED"];
   if (!base || !next || !allowed.includes(next)) return reply.code(400).send({ error: "target_invalid" }); const store = await load(); const target = store.commentTargets.find((item) => item.buyerId === buyerId && item.base.toLowerCase() === base); if (!target) return reply.code(404).send({ error: "target_not_found" });
-  const previous = `${target.status}|${target.discussion ?? ""}|${target.note ?? ""}`; target.status = next; target.discussion = String(req.body?.discussion ?? "").replace(/^@/, "") || undefined; target.note = String(req.body?.note ?? "").slice(0, 160) || undefined; target.updatedAt = now(); await save(store);
-  const current = `${target.status}|${target.discussion ?? ""}|${target.note ?? ""}`; if (current !== previous && next !== "CHECKING") sendBuyerAlert(store, buyerId, `Info Auto Komen · @${base}`, ({ READY: target.discussion ? `Akun lo siap memantau channel dan grup diskusinya (@${target.discussion}).` : "Akun lo siap memantau base ini.", PENDING_APPROVAL: "Permintaan join sedang menunggu persetujuan.", UNAVAILABLE: "Akun lo tidak bisa masuk atau mengakses target ini.", MUTED: "Akun lo tidak bisa mengirim komentar di target ini." } as Record<CommentTargetStatus, string>)[next]);
+  const previous = `${target.status}|${target.discussion ?? ""}|${target.note ?? ""}`; target.status = next; target.discussion = String(req.body?.discussion ?? "").replace(/^@/, "") || undefined; target.note = String(req.body?.note ?? "").slice(0, 160) || undefined; target.updatedAt = now();
+  const current = `${target.status}|${target.discussion ?? ""}|${target.note ?? ""}`;
+  if (current !== previous && next !== "CHECKING") {
+    const detail = ({ READY: target.discussion ? `Akun lo siap memantau channel dan grup diskusinya (@${target.discussion}).` : "Akun lo siap memantau base ini.", PENDING_APPROVAL: "Permintaan join sedang menunggu persetujuan.", UNAVAILABLE: "Akun lo tidak bisa masuk atau mengakses target ini.", MUTED: "Akun lo tidak bisa mengirim komentar di target ini." } as Record<CommentTargetStatus, string>)[next];
+    if (next === "UNAVAILABLE" || next === "MUTED") store.activities.unshift({ buyerId, kind: "COMMENT", status: "failed", label: `Komentar dijeda · @${base}`, at: now() });
+    sendBuyerAlert(store, buyerId, `Info Auto Komen · @${base}`, detail);
+  }
+  await save(store);
+  return { ok: true };
+});
+
+// Runner mengirim heartbeat ini hanya setelah session Telegram benar-benar lolos
+// otorisasi. Kalau Telegram mencabut session, dua modul userbot dihentikan sebelum
+// runner boleh mengambil pekerjaan baru.
+app.post<{ Body: { buyerId?: string; status?: UserbotAccountStatus; note?: string } }>("/api/internal/userbot-account-status", { preHandler: lpmAdapterOnly }, async (req, reply) => {
+  const buyerId = String(req.body?.buyerId ?? ""); const status = req.body?.status;
+  const allowed: UserbotAccountStatus[] = ["CONNECTED", "RECONNECT_REQUIRED"];
+  if (!buyerId || !status || !allowed.includes(status)) return reply.code(400).send({ error: "account_status_invalid" });
+  const store = await load(); const buyer = store.buyers.find((item) => item.id === buyerId);
+  if (!buyer) return reply.code(404).send({ error: "buyer_not_found" });
+  const note = String(req.body?.note ?? "").replace(/[_\s]+/g, " ").trim().slice(0, 160);
+  let removeSession = false;
+  if (status === "CONNECTED") {
+    buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue;
+  } else {
+    const changed = buyer.userbotAccountStatus !== "RECONNECT_REQUIRED";
+    buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "RECONNECT_REQUIRED"; buyer.userbotAccountIssue = note || "Sesi akun sudah tidak aktif."; buyer.commentActive = false; buyer.userBroadcastActive = false;
+    const broadcast = broadcastFor(store, buyer.id, "BUYER");
+    if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; }
+    for (const job of store.commentJobs) if (job.buyerId === buyer.id && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
+    removeSession = true;
+    if (changed) sendBuyerAlert(store, buyer.id, "Hubungkan ulang akun", "Sesi Telegram lo sudah tidak aktif. Auto Jaseb dan Auto Komen dijeda sampai akun dihubungkan lagi.");
+  }
+  buyer.updatedAt = now(); await save(store);
+  if (removeSession) await removeCommentSession(buyer.id).catch((error) => app.log.error({ err: error, buyerId }, "Could not remove revoked userbot session"));
   return { ok: true };
 });
 
@@ -708,14 +754,15 @@ app.post<{ Body: { buyerId?: string; workerId?: string; chat?: string; type?: "M
 });
 
 async function clearPendingCommentLogin(buyerId: string) { const login = pendingCommentLogins.get(buyerId); pendingCommentLogins.delete(buyerId); if (login) await login.client.disconnect().catch(() => undefined); }
-async function finishCommentLogin(login: PendingCommentLogin, buyer: Buyer, store: Store) { const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan."); await saveCommentSession(buyer.id, session); buyer.commentAccountConnected = true; buyer.updatedAt = now(); await save(store); pendingCommentLogins.delete(buyer.id); await login.client.disconnect(); startCommentRunner(buyer.id); }
+async function finishCommentLogin(login: PendingCommentLogin, buyer: Buyer, store: Store) { const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan."); await saveCommentSession(buyer.id, session); buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue; buyer.updatedAt = now(); await save(store); pendingCommentLogins.delete(buyer.id); await login.client.disconnect(); startCommentRunner(buyer.id); }
 
 app.post<{ Body: { phone?: string } }>("/api/buyer/comment-account/send-code", async (req, reply) => {
   const store = await load(); cleanup(store); const buyer = buyerForRequest(store, req);
   if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Layanan belum disiapkan untuk akun Telegram ini." });
   if (!hasPlanAccess(store, buyer, "COMMENT")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Auto Komen lo belum aktif." });
+  if (buyer.commentAccountConnected) return reply.code(409).send({ error: "account_already_connected", reason: "Akun Telegram lo sudah terhubung." });
   const phone = String(req.body?.phone ?? "").trim().replace(/[\s()-]/g, ""); if (!/^\+\d{8,15}$/.test(phone)) return reply.code(400).send({ error: "Masukkan nomor Telegram dengan kode negara." });
-  try { await clearPendingCommentLogin(buyer.id); const credentials = telegramCredentials(); const client = new TelegramClient(new StringSession(""), credentials.apiId, credentials.apiHash, { connectionRetries: 3 }); await client.connect(); const sent = await client.sendCode(credentials, phone); pendingCommentLogins.set(buyer.id, { buyerId: buyer.id, phone, phoneCodeHash: sent.phoneCodeHash, client, expiresAt: Date.now() + 5 * 60_000 }); return { ok: true, next: "CODE" }; }
+  try { await clearPendingCommentLogin(buyer.id); const credentials = telegramCredentials(); const client = new TelegramClient(new StringSession(""), credentials.apiId, credentials.apiHash, { connectionRetries: 3 }); await client.connect(); const sent = await client.sendCode(credentials, phone); buyer.userbotAccountStatus = "CONNECTING"; delete buyer.userbotAccountIssue; buyer.updatedAt = now(); await save(store); pendingCommentLogins.set(buyer.id, { buyerId: buyer.id, phone, phoneCodeHash: sent.phoneCodeHash, client, expiresAt: Date.now() + 5 * 60_000 }); return { ok: true, next: "CODE" }; }
   catch (error) { return reply.code(400).send({ error: telegramReason(error) }); }
 });
 
