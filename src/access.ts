@@ -1,4 +1,14 @@
 export type Plan = "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT";
+export type Product = "ADMIN_BROADCAST" | "USERBOT_PROMO";
+
+export function productPlans(product: Product): Plan[] { return product === "ADMIN_BROADCAST" ? ["BROADCAST"] : ["USERBOT_BROADCAST", "COMMENT"]; }
+export function extendedEndsAt(timestamp: number, activeEndsAt: readonly string[], durationDays: number) {
+  const extensionStart = Math.max(timestamp, ...activeEndsAt.map(Date.parse).filter(Number.isFinite));
+  return new Date(extensionStart + durationDays * 86_400_000).toISOString();
+}
+export function retainUserbotSession(commentAccess: boolean, userbotBroadcastAccess: boolean) { return commentAccess || userbotBroadcastAccess; }
+export function shouldCancelCommentWork(commentAccess: boolean) { return !commentAccess; }
+export function shouldNotifyExpiry(productHasAccess: boolean, alreadyNotified: boolean) { return !productHasAccess && !alreadyNotified; }
 
 export type AccessBuyer = {
   id: string;
@@ -10,7 +20,7 @@ export type AccessBuyer = {
 export type AccessSubscription = {
   buyerId: string;
   plan: Plan;
-  status: "ACTIVE" | "EXPIRED";
+  status: "ACTIVE" | "EXPIRED" | "REVOKED";
   endsAt: string;
 };
 

@@ -9,7 +9,7 @@ import { Bot, InlineKeyboard } from "grammy";
 import { Api, TelegramClient, password as telegramPassword } from "teleproto";
 import { StringSession } from "teleproto/sessions/index.js";
 import { loadPersistentStore, readEncryptedSessions, removeEncryptedSession, saveEncryptedSession, savePersistentStore } from "./database.js";
-import { buyerWithEffectiveAccess, clearManualPlanAccess, hasPlanAccess, reconcileManualPlanFlags, setManualPlanAccess, type Plan } from "./access.js";
+import { buyerWithEffectiveAccess, clearManualPlanAccess, extendedEndsAt, hasPlanAccess, productPlans, reconcileManualPlanFlags, retainUserbotSession, shouldCancelCommentWork, shouldNotifyExpiry, type Plan } from "./access.js";
 
 type Product = "ADMIN_BROADCAST" | "USERBOT_PROMO" | "LEGACY_BUNDLE";
 type Executor = "ADMIN" | "BUYER";
@@ -33,7 +33,7 @@ type PackageService = Product;
 type PaymentPlan = Product | "BUNDLE";
 type Package = { id: string; service: PackageService; name: string; price: number; durationDays: number; maxGroups: number; enabled: boolean; updatedAt: string };
 type Payment = { id: string; telegramId: string; packageId: string; plan: PaymentPlan; amount: number; durationDays: number; maxGroups: number; status: "PENDING" | "PAID" | "FAILED" | "EXPIRED"; gatewayReference?: string; paymentUrl?: string; withdrawalId?: string; createdAt: string; paidAt?: string };
-type Subscription = { id: string; buyerId: string; packageId: string; plan: Plan; product?: Product; maxGroups: number; status: "ACTIVE" | "EXPIRED"; startsAt: string; endsAt: string };
+type Subscription = { id: string; buyerId: string; packageId?: string; plan: Plan; product: Product; source: "MANUAL" | "PAYMENT"; maxGroups: number; status: "ACTIVE" | "EXPIRED" | "REVOKED"; startsAt: string; endsAt: string; revokedAt?: string; expiryNotifiedAt?: string };
 type WalletType = "DANA" | "GoPay" | "OVO" | "ShopeePay" | "LinkAja";
 type PayoutProfile = { telegramId: string; walletType: WalletType; walletNumber: string; walletOwner: string; updatedAt: string };
 type Withdrawal = { id: string; telegramId: string; grossAmount: number; fee: number; netAmount: number; walletType: WalletType; walletNumber: string; walletOwner: string; status: "REQUESTED" | "PAID"; createdAt: string; paidAt?: string };
@@ -131,6 +131,20 @@ async function load(): Promise<Store> {
     enabled: (item.service === "ADMIN_BROADCAST" || item.service === "USERBOT_PROMO") ? Boolean(item.enabled) : false,
     updatedAt: item.updatedAt ?? now(),
   }));
+  const oldPlansByBuyer = new Map<string, Set<Plan>>();
+  for (const item of ready.subscriptions as any[]) {
+    const plans = oldPlansByBuyer.get(String(item.buyerId)) ?? new Set<Plan>();
+    if (item.plan === "BROADCAST" || item.plan === "USERBOT_BROADCAST" || item.plan === "COMMENT") plans.add(item.plan);
+    oldPlansByBuyer.set(String(item.buyerId), plans);
+  }
+  ready.subscriptions = (ready.subscriptions as any[]).map((item: any) => {
+    const plans = oldPlansByBuyer.get(String(item.buyerId)) ?? new Set<Plan>();
+    const inferredProduct: Product = item.product === "ADMIN_BROADCAST" || item.product === "USERBOT_PROMO" || item.product === "LEGACY_BUNDLE"
+      ? item.product
+      : plans.has("BROADCAST") && plans.has("COMMENT") ? "LEGACY_BUNDLE"
+        : item.plan === "BROADCAST" ? "ADMIN_BROADCAST" : "USERBOT_PROMO";
+    return { ...item, packageId: item.packageId || undefined, plan: item.plan as Plan, product: inferredProduct, source: item.source === "MANUAL" ? "MANUAL" : "PAYMENT", maxGroups: Math.max(1, Math.floor(Number(item.maxGroups) || 15)), status: item.status === "REVOKED" ? "REVOKED" : item.status === "EXPIRED" ? "EXPIRED" : "ACTIVE", startsAt: item.startsAt ?? now(), endsAt: item.endsAt ?? now() } as Subscription;
+  });
   ready.broadcasts = (ready.broadcasts ?? []).map((item: any) => ({ ...item, executor: item.executor === "BUYER" ? "BUYER" : "ADMIN", mode: item.mode === "FORWARD" && item.forward ? "FORWARD" : "TEXT", forward: item.mode === "FORWARD" && item.forward ? { channel: String(item.forward.channel ?? ""), messageId: Number(item.forward.messageId), showSource: Boolean(item.forward.showSource) } : undefined, wording: String(item.wording ?? ""), intervalMinutes: broadcastInterval(item.intervalMinutes) }));
   ready.lpmTargets = ready.lpmTargets.map((item: any) => ({ ...item, executor: item.executor === "BUYER" ? "BUYER" : "ADMIN" }));
   ready.commentConfigs = (ready.commentConfigs ?? []).map((item: any) => ({ buyerId: item.buyerId, bases: item.bases ?? [], divisions: item.divisions ?? [{ id: id("division"), name: item.division ?? "Produk", keywords: item.keywords ?? [], blacklist: item.blacklist ?? [], wording: item.wording ?? "" }], mode: item.mode === "AUTO" ? "AUTO" : "APPROVAL", updatedAt: item.updatedAt ?? now(), updatedBy: item.updatedBy === "BUYER" ? "BUYER" : "ADMIN", ...(item.editingBy && item.editingUntil && Date.parse(item.editingUntil) > Date.now() ? { editingBy: item.editingBy === "BUYER" ? "BUYER" : "ADMIN", editingUntil: item.editingUntil } : {}) }));
@@ -290,6 +304,15 @@ function commerceFor(store: Store): Commerce {
   const withdrawals = [...store.withdrawals].sort((left, right) => Date.parse(right.paidAt ?? right.createdAt) - Date.parse(left.paidAt ?? left.createdAt)).slice(0, 20).map(({ id, grossAmount, fee, netAmount, walletType, walletNumber, walletOwner, status, createdAt, paidAt }) => ({ id, grossAmount, fee, netAmount, walletType, walletNumber, walletOwner, status, createdAt, paidAt }));
   return { today: total(paidOn((key) => key === today)), week: total(paidOn((key) => key >= weekStart && key <= today)), month: total(paidOn((key) => key.startsWith(month))), paidCount: paid.length, pendingBalance, availableBalance, requestedBalance, canRequestWithdrawal: withdrawWindowOpen(current) && availableBalance >= 30_000, orders, withdrawals };
 }
+function productLabel(product: "ADMIN_BROADCAST" | "USERBOT_PROMO") { return product === "ADMIN_BROADCAST" ? "Auto Sebar" : "Userbot Promosi"; }
+function activeSubscription(store: Store, buyerId: string, plan: Plan, timestamp = Date.now()) { return store.subscriptions.find((item) => item.buyerId === buyerId && item.plan === plan && item.status === "ACTIVE" && Date.parse(item.endsAt) > timestamp); }
+function productEntitlement(store: Store, buyer: Buyer, product: "ADMIN_BROADCAST" | "USERBOT_PROMO", timestamp = Date.now()) {
+  const plans = productPlans(product); const subscriptions = plans.map((plan) => activeSubscription(store, buyer.id, plan, timestamp)).filter(Boolean) as Subscription[];
+  const legacy = product === "ADMIN_BROADCAST" ? buyer.planBroadcast : Boolean(buyer.planUserBroadcast || buyer.planComment);
+  const endsAt = subscriptions.length ? subscriptions.map((item) => item.endsAt).sort().at(-1) : undefined;
+  const maxGroups = subscriptions.filter((item) => item.plan !== "COMMENT").map((item) => item.maxGroups).sort((a, b) => b - a)[0];
+  return { active: subscriptions.length === plans.length, hasAccess: subscriptions.length > 0 || legacy, legacy: !subscriptions.length && legacy, endsAt, maxGroups };
+}
 function maxGroupsForBuyer(store: Store, buyer: Buyer, plan: "BROADCAST" | "USERBOT_BROADCAST" = "BROADCAST") {
   const active = store.subscriptions
     .filter((item) => item.buyerId === buyer.id && item.plan === plan && item.status === "ACTIVE" && Date.parse(item.endsAt) > Date.now())
@@ -311,19 +334,32 @@ function releaseWorkerWhenGroupsCleared(store: Store, buyer: Buyer) {
 function cleanup(store: Store) {
   const before = JSON.stringify(store);
   const ago = (days: number) => Date.now() - days * 86_400_000;
-  for (const subscription of store.subscriptions) if (subscription.status === "ACTIVE" && Date.parse(subscription.endsAt) <= Date.now()) subscription.status = "EXPIRED";
+  const expiredProducts = new Map<string, "ADMIN_BROADCAST" | "USERBOT_PROMO">();
+  for (const subscription of store.subscriptions) if (subscription.status === "ACTIVE" && Date.parse(subscription.endsAt) <= Date.now()) {
+    subscription.status = "EXPIRED";
+    if (subscription.product === "ADMIN_BROADCAST" || subscription.product === "USERBOT_PROMO") expiredProducts.set(`${subscription.buyerId}:${subscription.product}`, subscription.product);
+  }
   for (const buyer of store.buyers) {
     const ownsSubscription = store.subscriptions.some((item) => item.buyerId === buyer.id);
     if (!ownsSubscription) continue;
     const access = reconcileManualPlanFlags(store, buyer);
     if (!access.broadcast) { buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); }
     if (!access.userbotBroadcast) { buyer.userBroadcastActive = false; const broadcast = broadcastFor(store, buyer.id, "BUYER"); if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
-    if (!access.comment) { buyer.commentActive = false; if (!access.userbotBroadcast) { buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "DISCONNECTED"; delete buyer.userbotAccountIssue; } }
+    if (!access.comment) buyer.commentActive = false;
+    if (!retainUserbotSession(access.comment, access.userbotBroadcast)) { buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "DISCONNECTED"; delete buyer.userbotAccountIssue; }
   }
-  const expiredBuyerIds = new Set(store.buyers.filter((buyer) => !hasPlanAccess(store, buyer, "COMMENT") && !hasPlanAccess(store, buyer, "USERBOT_BROADCAST")).map((buyer) => buyer.id));
-  for (const job of store.commentJobs) if (expiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
-  store.approvalCandidates = store.approvalCandidates.filter((item) => !expiredBuyerIds.has(item.buyerId));
-  store.dedupe = store.dedupe.filter((item) => !expiredBuyerIds.has(item.buyerId));
+  const commentExpiredBuyerIds = new Set(store.buyers.filter((buyer) => shouldCancelCommentWork(hasPlanAccess(store, buyer, "COMMENT"))).map((buyer) => buyer.id));
+  for (const job of store.commentJobs) if (commentExpiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
+  store.approvalCandidates = store.approvalCandidates.filter((item) => !commentExpiredBuyerIds.has(item.buyerId));
+  store.dedupe = store.dedupe.filter((item) => !commentExpiredBuyerIds.has(item.buyerId));
+  for (const [key, product] of expiredProducts) {
+    const [buyerId] = key.split(":"); const buyer = store.buyers.find((item) => item.id === buyerId);
+    if (!buyer || productEntitlement(store, buyer, product).hasAccess) continue;
+    const subscriptions = store.subscriptions.filter((item) => item.buyerId === buyer.id && item.product === product);
+    if (!shouldNotifyExpiry(false, subscriptions.some((item) => item.expiryNotifiedAt))) continue;
+    const markedAt = now(); for (const subscription of subscriptions) subscription.expiryNotifiedAt = markedAt;
+    sendBuyerAlert(store, buyer.id, "Masa aktif habis", `${productLabel(product)} sudah tidak aktif. Hubungi admin untuk lanjut.`);
+  }
   store.approvalCandidates = store.approvalCandidates.filter((item) => Date.parse(item.createdAt) > ago(2));
   store.commentJobs = store.commentJobs.filter((item) => Date.parse(item.createdAt) > ago(30));
   store.dedupe = store.dedupe.filter((item) => Date.parse(item.at) > ago(7));
@@ -349,7 +385,7 @@ async function reconcileRunners() {
       // Satu runner buyer mengelola dua modul Userbot Promosi. Jangan spawn runner
       // kedua untuk Jaseb akun buyer karena dua koneksi dengan session yang sama bisa
       // membuat Telegram menolak auth key atau mengirim dobel.
-      const allowed = Boolean(buyer && (hasPlanAccess(store, buyer, "COMMENT") || hasPlanAccess(store, buyer, "USERBOT_BROADCAST")));
+      const allowed = Boolean(buyer && retainUserbotSession(hasPlanAccess(store, buyer, "COMMENT"), hasPlanAccess(store, buyer, "USERBOT_BROADCAST")));
       if (buyer && buyer.commentAccountConnected && allowed) startCommentRunner(buyerId);
       else { stopCommentRunner(buyerId); await removeCommentSession(buyerId); if (buyer) buyer.commentAccountConnected = false; }
     }
@@ -376,6 +412,7 @@ app.get("/api/buyer/dashboard", async (req, reply) => {
   if (!buyer) return { onboarding: true, buyer: null, worker: null, broadcast: null, userBroadcast: null, lpmTargets: [], userLpmTargets: [], commentTargets: [], comment: null, activity: [] };
   return {
     buyer: buyerWithEffectiveAccess(store, buyer),
+    entitlements: entitlementSummary(store, buyer),
     broadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),
     userBroadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),
     worker: buyer.workerId ? store.workers.find((item) => item.id === buyer.workerId) ?? null : null,
@@ -423,37 +460,35 @@ async function pakasirTransaction(config: { project: string; apiKey: string }, p
   if (!transaction || String(transaction.project) !== config.project || Number(transaction.amount) !== payment.amount || String(transaction.order_id) !== (payment.gatewayReference ?? payment.id)) throw new Error("Data pembayaran Pakasir tidak sesuai.");
   return String(transaction.status ?? "").toLowerCase();
 }
+function activateProduct(store: Store, buyer: Buyer, product: "ADMIN_BROADCAST" | "USERBOT_PROMO", durationDays: number, maxGroups: number, source: "MANUAL" | "PAYMENT", packageId?: string) {
+  const plans = productPlans(product); const active = plans.map((plan) => activeSubscription(store, buyer.id, plan));
+  const startsAt = now(); const endsAt = extendedEndsAt(Date.now(), active.filter(Boolean).map((item) => item!.endsAt), durationDays);
+  for (const plan of plans) {
+    const current = active.find((item) => item?.plan === plan);
+    const planMaxGroups = plan === "COMMENT" ? 15 : maxGroups;
+    if (current) {
+      current.packageId = packageId; current.product = product; current.source = source; current.maxGroups = planMaxGroups; current.endsAt = endsAt; delete current.revokedAt; delete current.expiryNotifiedAt;
+    } else store.subscriptions.push({ id: id("subscription"), buyerId: buyer.id, packageId, plan, product, source, maxGroups: planMaxGroups, status: "ACTIVE", startsAt, endsAt });
+  }
+  clearManualPlanAccess(buyer, plans); buyer.legacyBundle = false; buyer.updatedAt = now();
+  return endsAt;
+}
 function activatePaidPackage(store: Store, payment: Payment) {
   const buyer = store.buyers.find((item) => item.telegramId === payment.telegramId);
   if (!buyer) throw new Error("Akun buyer tidak ditemukan.");
-  // Legacy bundle tetap dihormati, tetapi produk baru punya capability yang tegas:
-  // admin broadcast tak pernah menggunakan session buyer, sedangkan Userbot Promosi
-  // menyatukan broadcast akun buyer + Auto Komen dalam satu masa aktif.
-  const plans: Plan[] = payment.plan === "ADMIN_BROADCAST"
-    ? ["BROADCAST"]
-    : payment.plan === "USERBOT_PROMO"
-      ? ["USERBOT_BROADCAST", "COMMENT"]
-      : ["BROADCAST", "COMMENT"];
-  const active = plans.map((plan) => store.subscriptions.find((item) => item.buyerId === buyer.id && item.plan === plan && item.status === "ACTIVE" && Date.parse(item.endsAt) > Date.now()));
-  const extensionStart = Math.max(Date.now(), ...active.filter(Boolean).map((item) => Date.parse(item!.endsAt)));
-  const startsAt = now();
-  const endsAt = new Date(extensionStart + payment.durationDays * 86_400_000).toISOString();
-  const subscriptionProduct: Product = payment.plan === "BUNDLE" ? "LEGACY_BUNDLE" : payment.plan;
-  for (const plan of plans) {
-    const current = active.find((item) => item?.plan === plan);
-    const maxGroups = plan === "BROADCAST" || plan === "USERBOT_BROADCAST" ? payment.maxGroups : 15;
-    if (current) {
-      current.packageId = payment.packageId; current.product = subscriptionProduct; current.maxGroups = maxGroups; current.endsAt = endsAt;
-    } else {
-      store.subscriptions.push({ id: id("subscription"), buyerId: buyer.id, packageId: payment.packageId, plan, product: subscriptionProduct, maxGroups, status: "ACTIVE", startsAt, endsAt });
-    }
-  }
-  clearManualPlanAccess(buyer, plans);
-  if (payment.plan !== "LEGACY_BUNDLE") buyer.legacyBundle = false;
+  if (payment.plan !== "ADMIN_BROADCAST" && payment.plan !== "USERBOT_PROMO") throw new Error("Paket lama tidak bisa diaktifkan lagi.");
+  const endsAt = activateProduct(store, buyer, payment.plan, payment.durationDays, payment.maxGroups, "PAYMENT", payment.packageId);
   buyer.updatedAt = now();
   payment.status = "PAID"; payment.paidAt = now();
-  const label = payment.plan === "ADMIN_BROADCAST" ? "Auto Sebar" : payment.plan === "USERBOT_PROMO" ? "Userbot Promosi" : "Paket Promosi";
-  sendBuyerAlert(store, buyer.id, "Pembayaran berhasil", `${label} aktif sampai ${new Date(endsAt).toLocaleDateString("id-ID")}.`);
+  sendBuyerAlert(store, buyer.id, "Pembayaran berhasil", `${productLabel(payment.plan)} aktif sampai ${new Date(endsAt).toLocaleDateString("id-ID")}.`);
+}
+function revokeProduct(store: Store, buyer: Buyer, product: "ADMIN_BROADCAST" | "USERBOT_PROMO") {
+  const timestamp = now(); const plans = productPlans(product);
+  for (const subscription of store.subscriptions) if (subscription.buyerId === buyer.id && subscription.product === product && subscription.status === "ACTIVE") { subscription.status = "REVOKED"; subscription.revokedAt = timestamp; }
+  clearManualPlanAccess(buyer, plans); buyer.updatedAt = timestamp;
+}
+function entitlementSummary(store: Store, buyer: Buyer) {
+  return { adminBroadcast: productEntitlement(store, buyer, "ADMIN_BROADCAST"), userbotPromo: productEntitlement(store, buyer, "USERBOT_PROMO") };
 }
 app.post<{ Body: { packageId?: string } }>("/api/public/checkout", async (req, reply) => {
   if (!selfServiceSubscriptionsEnabled) return reply.code(503).send({ error: "subscriptions_closed", reason: "Langganan sementara ditutup. Hubungi admin @Kertaaji untuk pengaktifan layanan." });
@@ -684,9 +719,9 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: strin
   if (failed) {
     store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() });
     const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.username.toLowerCase() === group.toLowerCase());
-    if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { if (target) { target.status = "UNAVAILABLE"; target.note = "Akun lo tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Jaseb · @${group}`, "Akun lo tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); }
-    else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Jaseb · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain.");
-    else sendBuyerAlert(store, buyer.id, `Info Auto Jaseb · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`);
+    if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { if (target) { target.status = "UNAVAILABLE"; target.note = "Akun lo tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun lo tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); }
+    else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain.");
+    else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`);
   } else { broadcast.lastSentAt = now(); const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
   cleanup(store); await save(store); return { ok: true, nextSendAt: broadcast.nextSendAt };
 });
@@ -735,7 +770,7 @@ app.post<{ Body: { buyerId?: string; status?: UserbotAccountStatus; note?: strin
     if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; }
     for (const job of store.commentJobs) if (job.buyerId === buyer.id && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
     removeSession = true;
-    if (changed) sendBuyerAlert(store, buyer.id, "Hubungkan ulang akun", "Sesi Telegram lo sudah tidak aktif. Auto Jaseb dan Auto Komen dijeda sampai akun dihubungkan lagi.");
+    if (changed) sendBuyerAlert(store, buyer.id, "Hubungkan ulang akun", "Sesi Telegram lo sudah tidak aktif. Auto Sebar dan Auto Komen dijeda sampai akun dihubungkan lagi.");
   }
   buyer.updatedAt = now(); await save(store);
   if (removeSession) await removeCommentSession(buyer.id).catch((error) => app.log.error({ err: error, buyerId }, "Could not remove revoked userbot session"));
@@ -846,6 +881,7 @@ app.post<{ Body: { buyerId?: string; base?: string; messageId?: string; commentM
   if (!buyerId || !base || !messageId || !commentMessageId) return reply.code(400).send({ error: "Data komentar otomatis belum lengkap." });
   const store = await load(); const buyer = store.buyers.find((item) => item.id === buyerId);
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
+  if (!buyer.commentActive || !buyer.commentAccountConnected || !hasPlanAccess(store, buyer, "COMMENT")) return reply.code(403).send({ error: "comment_not_ready" });
   const existing = store.commentJobs.find((item) => item.buyerId === buyerId && item.base.toLowerCase() === base.toLowerCase() && item.messageId === messageId && item.commentMessageId === commentMessageId);
   if (existing) return { ok: true, duplicate: true };
   const job: CommentJob = { id: id("comment"), buyerId, base, messageId, commentMessageId, wording: String(body.wording ?? ""), link: String(body.link ?? ""), preview: previewText(String(body.text ?? "")), status: "DONE", createdAt: now() };
@@ -870,7 +906,27 @@ app.post<{ Params: { id: string }; Body: { deleteToken?: string; error?: string 
 app.get("/api/admin/overview", { preHandler: adminOnly }, async () => {
   const store = await load(); if (cleanup(store)) await save(store);
   const workerSessions = Object.keys(await readWorkerSessions());
-  return { buyers: store.buyers.map((buyer) => buyerWithEffectiveAccess(store, buyer)), workers: store.workers, workerSessions, broadcasts: store.broadcasts, lpmTargets: store.lpmTargets.filter((item) => item.status !== "REMOVED"), comments: store.commentConfigs, subscriptions: store.subscriptions, packages: store.packages, commerce: commerceFor(store) };
+  return { buyers: store.buyers.map((buyer) => buyerWithEffectiveAccess(store, buyer)), entitlements: Object.fromEntries(store.buyers.map((buyer) => [buyer.id, entitlementSummary(store, buyer)])), workers: store.workers, workerSessions, broadcasts: store.broadcasts, lpmTargets: store.lpmTargets.filter((item) => item.status !== "REMOVED"), comments: store.commentConfigs, subscriptions: store.subscriptions, packages: store.packages, commerce: commerceFor(store) };
+});
+
+app.post<{ Params: { id: string }; Body: { product?: "ADMIN_BROADCAST" | "USERBOT_PROMO"; durationDays?: number; maxGroups?: number } }>("/api/admin/buyers/:id/subscriptions", { preHandler: adminOnly }, async (req, reply) => {
+  const product = req.body?.product; const durationDays = Math.floor(Number(req.body?.durationDays)); const maxGroups = Math.floor(Number(req.body?.maxGroups));
+  if (product !== "ADMIN_BROADCAST" && product !== "USERBOT_PROMO") return reply.code(400).send({ error: "Produk akses tidak valid." });
+  if (!Number.isInteger(durationDays) || durationDays < 1 || durationDays > 365) return reply.code(400).send({ error: "Masa aktif harus 1 sampai 365 hari." });
+  if (!Number.isInteger(maxGroups) || maxGroups < 1) return reply.code(400).send({ error: "Maksimal LPM harus diisi." });
+  const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
+  if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
+  const endsAt = activateProduct(store, buyer, product, durationDays, maxGroups, "MANUAL"); cleanup(store); await save(store); reconcileRunnersSafely();
+  return { ok: true, endsAt, entitlements: entitlementSummary(store, buyer) };
+});
+
+app.post<{ Params: { id: string; product: string } }>("/api/admin/buyers/:id/subscriptions/:product/revoke", { preHandler: adminOnly }, async (req, reply) => {
+  const product = req.params.product;
+  if (product !== "ADMIN_BROADCAST" && product !== "USERBOT_PROMO") return reply.code(400).send({ error: "Produk akses tidak valid." });
+  const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
+  if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
+  revokeProduct(store, buyer, product); cleanup(store); await save(store); reconcileRunnersSafely();
+  return { ok: true, entitlements: entitlementSummary(store, buyer) };
 });
 
 const withdrawalFee = 5_000;
@@ -1010,7 +1066,8 @@ app.delete<{ Params: { id: string } }>("/api/admin/workers/:id", { preHandler: a
 app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?: boolean; workerId?: string | null; broadcastMode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number; bases?: string; divisions?: unknown; mode?: "APPROVAL" | "AUTO" } }>("/api/admin/buyers/:id/setup", { preHandler: adminOnly }, async (req, reply) => {
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
-  setManualPlanAccess(store, buyer, "BROADCAST", Boolean(req.body.planBroadcast)); setManualPlanAccess(store, buyer, "COMMENT", Boolean(req.body.planComment));
+  if (Boolean(req.body.planBroadcast) && !hasPlanAccess(store, buyer, "BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Auto Sebar belum aktif." });
+  if (Boolean(req.body.planComment) && !hasPlanAccess(store, buyer, "COMMENT")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
   if (Boolean(req.body.planBroadcast)) {
     const worker = store.workers.find((item) => item.id === req.body.workerId);
     if (!worker || (worker.status !== "AVAILABLE" && worker.buyerId !== buyer.id)) return reply.code(409).send({ error: "Pilih worker yang tersedia untuk buyer ini." });
@@ -1036,13 +1093,14 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; 
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
   if (!req.body.enabled) {
-    setManualPlanAccess(store, buyer, "BROADCAST", false); buyer.broadcastActive = false; unlockBroadcast(buyer, "ADMIN");
+    buyer.broadcastActive = false; unlockBroadcast(buyer, "ADMIN");
     for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); }
     releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN");
     buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
   }
+  if (!hasPlanAccess(store, buyer, "BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Auto Sebar belum aktif." });
   if (!req.body.workerId) {
-    setManualPlanAccess(store, buyer, "BROADCAST", true); unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
+    unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
     return { ok: true, buyer };
   }
   try { requireBroadcastLock(buyer, "ADMIN"); } catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
@@ -1051,7 +1109,7 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; 
   let content: ReturnType<typeof broadcastContent>; try { content = broadcastContent(req.body ?? {}); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
   let groups: string[]; try { groups = cleanGroups(req.body.groups, maxGroupsForBuyer(store, buyer)); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
   for (const item of store.workers) if (item.buyerId === buyer.id && item.id !== worker.id) { item.buyerId = null; item.status = "AVAILABLE"; }
-  worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id; setManualPlanAccess(store, buyer, "BROADCAST", true);
+  worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
   syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
@@ -1081,18 +1139,18 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; bases?: string; div
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
   if (!req.body.enabled) {
-    setManualPlanAccess(store, buyer, "COMMENT", false); setManualPlanAccess(store, buyer, "USERBOT_BROADCAST", false); buyer.commentActive = false; buyer.userBroadcastActive = false; store.commentConfigs = store.commentConfigs.filter((item) => item.buyerId !== buyer.id);
+    buyer.commentActive = false; buyer.userBroadcastActive = false; store.commentConfigs = store.commentConfigs.filter((item) => item.buyerId !== buyer.id);
     buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
   }
+  if (!hasPlanAccess(store, buyer, "COMMENT")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
   const bases = split(req.body.bases);
   if (!bases.length) {
-    setManualPlanAccess(store, buyer, "COMMENT", true); setManualPlanAccess(store, buyer, "USERBOT_BROADCAST", true); buyer.updatedAt = now(); await save(store);
+    buyer.updatedAt = now(); await save(store);
     return { ok: true, buyer };
   }
   const current = commentConfigFor(store, buyer.id);
   try { requireCommentLock(current, "ADMIN"); } catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
   let divisions: CommentDivision[]; try { divisions = cleanDivisions(req.body.divisions); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
-  setManualPlanAccess(store, buyer, "COMMENT", true); setManualPlanAccess(store, buyer, "USERBOT_BROADCAST", true);
   current.bases = bases; current.divisions = divisions; current.mode = req.body.mode === "AUTO" ? "AUTO" : "APPROVAL"; current.updatedAt = now(); current.updatedBy = "ADMIN"; unlockComment(current, "ADMIN"); syncCommentTargets(store, buyer.id, current.bases); buyer.updatedAt = now(); await save(store);
   const config = current;
   return { ok: true, buyer, config };
