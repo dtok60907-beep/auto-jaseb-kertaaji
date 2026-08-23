@@ -8,6 +8,7 @@
     "dev:api": "tsx watch src/server.ts",
     "dev:web": "vite",
     "build": "tsc --noEmit && vite build",
+    "test": "node --experimental-strip-types --test test/access.test.ts",
     "start": "NODE_ENV=production tsx src/server.ts",
     "db:migrate": "tsx scripts/migrate.ts",
     "worker:login": "tsx scripts/connect-worker.ts",
