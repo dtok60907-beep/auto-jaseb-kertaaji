@@ -827,12 +827,19 @@ app.post<{ Body: { buyerId?: string; base?: string; messageId?: string; link?: s
   incomingLeadLocks.add(leadKey);
   try {
     const store = await load(); cleanup(store); const buyer = store.buyers.find((item) => item.id === targetBuyer); const config = store.commentConfigs.find((item) => item.buyerId === targetBuyer);
-    if (!buyer?.commentActive || !hasPlanAccess(store, buyer, "COMMENT") || !config || !buyer.commentAccountConnected) return { action: "ignored", reason: "comment_off_or_not_ready" };
+    if (!buyer?.commentActive || !hasPlanAccess(store, buyer, "COMMENT") || !config || !buyer.commentAccountConnected) {
+      app.log.info({ buyerId: targetBuyer, base, messageId, reason: "comment_off_or_not_ready" }, "Incoming post ignored");
+      return { action: "ignored", reason: "comment_off_or_not_ready" };
+    }
     const baseAllowed = config.bases.some((item) => item.replace(/^@/, "").toLowerCase() === base.toLowerCase());
     const targetReady = store.commentTargets.some((item) => item.buyerId === targetBuyer && item.base.toLowerCase() === base.toLowerCase() && item.status === "READY");
     const division = config.divisions.map((item) => ({ ...item, hits: item.keywords.filter((word) => matchTerm(word, text)).length, blocked: item.blacklist.some((word) => matchTerm(word, text)) })).filter((item) => item.hits > 0 && !item.blocked).sort((a, b) => b.hits - a.hits)[0];
     const duplicate = store.dedupe.some((item) => item.buyerId === targetBuyer && item.base === base && item.messageId === messageId);
-    if (!baseAllowed || !targetReady || !division || duplicate) return { action: "ignored", reason: !baseAllowed ? "base_not_selected" : !targetReady ? "target_not_ready" : duplicate ? "duplicate" : "keyword_miss" };
+    if (!baseAllowed || !targetReady || !division || duplicate) {
+      const reason = !baseAllowed ? "base_not_selected" : !targetReady ? "target_not_ready" : duplicate ? "duplicate" : "keyword_miss";
+      app.log.info({ buyerId: targetBuyer, base, messageId, reason, preview: previewText(sourceText).slice(0, 120) }, "Incoming post ignored");
+      return { action: "ignored", reason };
+    }
     store.dedupe.push({ buyerId: targetBuyer, base, messageId, at: now() });
     if (config.mode === "APPROVAL") {
       const candidate: Candidate = { id: id("lead"), buyerId: targetBuyer, base, messageId, link: String(body.link ?? ""), wording: division.wording, preview: previewText(sourceText), createdAt: now() };
