@@ -10,12 +10,15 @@ import { Api, TelegramClient, password as telegramPassword } from "teleproto";
 import { StringSession } from "teleproto/sessions/index.js";
 import { loadPersistentStore, readEncryptedSessions, removeEncryptedSession, saveEncryptedSession, savePersistentStore } from "./database.js";
 
-type Buyer = { id: string; name: string; telegramId: string; broadcastActive: boolean; commentActive: boolean; commentAccountConnected: boolean; planBroadcast: boolean; planComment: boolean; workerId: string | null; updatedAt: string; broadcastEditingBy?: CommentActor; broadcastEditingUntil?: string };
+type Product = "ADMIN_BROADCAST" | "USERBOT_PROMO" | "LEGACY_BUNDLE";
+type Plan = "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT";
+type Executor = "ADMIN" | "BUYER";
+type Buyer = { id: string; name: string; telegramId: string; broadcastActive: boolean; userBroadcastActive?: boolean; commentActive: boolean; commentAccountConnected: boolean; planBroadcast: boolean; planUserBroadcast?: boolean; planComment: boolean; legacyBundle?: boolean; workerId: string | null; updatedAt: string; broadcastEditingBy?: CommentActor; broadcastEditingUntil?: string; userBroadcastEditingBy?: CommentActor; userBroadcastEditingUntil?: string };
 type Worker = { id: string; label: string; username: string; status: "AVAILABLE" | "ASSIGNED" | "COOLDOWN" | "DISABLED"; buyerId: string | null; cooldownUntil?: string; createdAt: string };
 type ForwardSource = { channel: string; messageId: number; showSource: boolean };
-type Broadcast = { buyerId: string; wording: string; mode: "TEXT" | "FORWARD"; forward?: ForwardSource; groups: string[]; intervalMinutes: number; updatedBy: "ADMIN" | "BUYER"; updatedAt: string; nextSendAt?: string; lastSentAt?: string; lastGroup?: string; groupCursor?: number; deliveryToken?: string; deliveryUntil?: string };
+type Broadcast = { buyerId: string; executor?: Executor; wording: string; mode: "TEXT" | "FORWARD"; forward?: ForwardSource; groups: string[]; intervalMinutes: number; updatedBy: "ADMIN" | "BUYER"; updatedAt: string; nextSendAt?: string; lastSentAt?: string; lastGroup?: string; groupCursor?: number; deliveryToken?: string; deliveryUntil?: string };
 type LpmTargetStatus = "CONNECTING" | "PENDING_APPROVAL" | "READY" | "UNAVAILABLE" | "REMOVING" | "REMOVED";
-type LpmTarget = { id: string; buyerId: string; workerId: string; username: string; status: LpmTargetStatus; desired: boolean; note?: string; createdAt: string; updatedAt: string };
+type LpmTarget = { id: string; buyerId: string; workerId: string; executor?: Executor; username: string; status: LpmTargetStatus; desired: boolean; note?: string; createdAt: string; updatedAt: string };
 type CommentDivision = { id: string; name: string; keywords: string[]; blacklist: string[]; wording: string };
 type CommentActor = "ADMIN" | "BUYER";
 type CommentConfig = { buyerId: string; bases: string[]; divisions: CommentDivision[]; mode: "APPROVAL" | "AUTO"; updatedAt: string; updatedBy: CommentActor; editingBy?: CommentActor; editingUntil?: string };
@@ -24,12 +27,12 @@ type CommentTarget = { id: string; buyerId: string; base: string; discussion?: s
 type Activity = { buyerId: string; kind: "BROADCAST" | "COMMENT"; status: string; label: string; link?: string; at: string };
 type Candidate = { id: string; buyerId: string; base: string; messageId: string; link: string; wording: string; preview: string; createdAt: string };
 type CommentJob = { id: string; buyerId: string; base: string; messageId: string; wording: string; link: string; preview: string; commentMessageId?: string; status: "PENDING" | "SENDING" | "DONE" | "FAILED" | "CANCELED" | "DELETE_PENDING" | "DELETING" | "DELETED" | "DELETE_FAILED"; deliveryToken?: string; deliveryUntil?: string; deleteToken?: string; deleteUntil?: string; createdAt: string };
-type Plan = "BROADCAST" | "COMMENT";
-type PackageService = "BUNDLE";
-type PaymentPlan = Plan | PackageService;
+type PackageService = Product;
+// BUNDLE hanya untuk membaca riwayat sebelum pemisahan produk; tidak bisa dibuat lagi.
+type PaymentPlan = Product | "BUNDLE";
 type Package = { id: string; service: PackageService; name: string; price: number; durationDays: number; maxGroups: number; enabled: boolean; updatedAt: string };
 type Payment = { id: string; telegramId: string; packageId: string; plan: PaymentPlan; amount: number; durationDays: number; maxGroups: number; status: "PENDING" | "PAID" | "FAILED" | "EXPIRED"; gatewayReference?: string; paymentUrl?: string; withdrawalId?: string; createdAt: string; paidAt?: string };
-type Subscription = { id: string; buyerId: string; packageId: string; plan: Plan; maxGroups: number; status: "ACTIVE" | "EXPIRED"; startsAt: string; endsAt: string };
+type Subscription = { id: string; buyerId: string; packageId: string; plan: Plan; product?: Product; maxGroups: number; status: "ACTIVE" | "EXPIRED"; startsAt: string; endsAt: string };
 type WalletType = "DANA" | "GoPay" | "OVO" | "ShopeePay" | "LinkAja";
 type PayoutProfile = { telegramId: string; walletType: WalletType; walletNumber: string; walletOwner: string; updatedAt: string };
 type Withdrawal = { id: string; telegramId: string; grossAmount: number; fee: number; netAmount: number; walletType: WalletType; walletNumber: string; walletOwner: string; status: "REQUESTED" | "PAID"; createdAt: string; paidAt?: string };
@@ -104,7 +107,38 @@ function stopCommentRunner(buyerId: string) { terminateRunner(commentRunners.get
 
 const defaultPackages = (): Package[] => [];
 const selfServiceSubscriptionsEnabled = process.env.SELF_SERVICE_SUBSCRIPTIONS === "true";
-async function load(): Promise<Store> { const store = await loadPersistentStore<Partial<Store>>(dataFile, {}); const ready = { ...store, buyers: store.buyers ?? [], workers: store.workers ?? [], broadcasts: store.broadcasts ?? [], commentConfigs: store.commentConfigs ?? [], activities: store.activities ?? [], approvalCandidates: store.approvalCandidates ?? [], dedupe: store.dedupe ?? [], payments: store.payments ?? [], withdrawals: store.withdrawals ?? [], payoutProfiles: store.payoutProfiles ?? [], subscriptions: store.subscriptions ?? [], packages: store.packages ?? defaultPackages(), lpmTargets: store.lpmTargets ?? [], commentTargets: store.commentTargets ?? [], commentJobs: store.commentJobs ?? [] } as Store; ready.packages = ready.packages.map((item: any) => ({ id: item.id ?? id("package"), service: "BUNDLE" as const, name: item.name || "Paket Promosi", price: item.price, durationDays: item.durationDays, maxGroups: Math.max(1, Math.floor(Number(item.maxGroups) || 15)), enabled: item.enabled, updatedAt: item.updatedAt ?? now() })); ready.broadcasts = (ready.broadcasts ?? []).map((item: any) => ({ ...item, mode: item.mode === "FORWARD" && item.forward ? "FORWARD" : "TEXT", forward: item.mode === "FORWARD" && item.forward ? { channel: String(item.forward.channel ?? ""), messageId: Number(item.forward.messageId), showSource: Boolean(item.forward.showSource) } : undefined, wording: String(item.wording ?? ""), intervalMinutes: broadcastInterval(item.intervalMinutes) })); ready.commentConfigs = (ready.commentConfigs ?? []).map((item: any) => ({ buyerId: item.buyerId, bases: item.bases ?? [], divisions: item.divisions ?? [{ id: id("division"), name: item.division ?? "Produk", keywords: item.keywords ?? [], blacklist: item.blacklist ?? [], wording: item.wording ?? "" }], mode: item.mode === "AUTO" ? "AUTO" : "APPROVAL", updatedAt: item.updatedAt ?? now(), updatedBy: item.updatedBy === "BUYER" ? "BUYER" : "ADMIN", ...(item.editingBy && item.editingUntil && Date.parse(item.editingUntil) > Date.now() ? { editingBy: item.editingBy === "BUYER" ? "BUYER" : "ADMIN", editingUntil: item.editingUntil } : {}) })); ready.approvalCandidates = (ready.approvalCandidates ?? []).map((item: any) => ({ ...item, wording: String(item.wording ?? ready.commentConfigs.find((config) => config.buyerId === item.buyerId)?.divisions[0]?.wording ?? ""), preview: String(item.preview ?? "") })); ready.commentJobs = ready.commentJobs.map((item: any) => ({ ...item, preview: String(item.preview ?? "") })); for (const worker of ready.workers) if (worker.status === "COOLDOWN") { worker.status = "AVAILABLE"; worker.buyerId = null; delete worker.cooldownUntil; } for (const broadcast of ready.broadcasts) { const buyer = ready.buyers.find((item) => item.id === broadcast.buyerId); if (!buyer?.workerId || ready.lpmTargets.some((item) => item.buyerId === broadcast.buyerId)) continue; for (const username of broadcast.groups) ready.lpmTargets.push({ id: id("lpm"), buyerId: broadcast.buyerId, workerId: buyer.workerId, username, status: "READY", desired: true, createdAt: now(), updatedAt: now() }); } return ready; }
+async function load(): Promise<Store> {
+  const store = await loadPersistentStore<Partial<Store>>(dataFile, {});
+  const ready = { ...store, buyers: store.buyers ?? [], workers: store.workers ?? [], broadcasts: store.broadcasts ?? [], commentConfigs: store.commentConfigs ?? [], activities: store.activities ?? [], approvalCandidates: store.approvalCandidates ?? [], dedupe: store.dedupe ?? [], payments: store.payments ?? [], withdrawals: store.withdrawals ?? [], payoutProfiles: store.payoutProfiles ?? [], subscriptions: store.subscriptions ?? [], packages: store.packages ?? defaultPackages(), lpmTargets: store.lpmTargets ?? [], commentTargets: store.commentTargets ?? [], commentJobs: store.commentJobs ?? [] } as Store;
+
+  // Paket lama BUNDLE sengaja tidak dijual lagi. Aksesnya tetap dipertahankan sebagai
+  // legacy sampai habis, jadi tidak ada buyer lama yang berganti executor diam-diam.
+  ready.packages = ready.packages.map((item: any) => ({
+    id: item.id ?? id("package"),
+    service: item.service === "ADMIN_BROADCAST" || item.service === "USERBOT_PROMO" ? item.service : "LEGACY_BUNDLE" as PackageService,
+    name: item.name || "Paket Promosi", price: item.price, durationDays: item.durationDays,
+    maxGroups: Math.max(1, Math.floor(Number(item.maxGroups) || 15)),
+    enabled: (item.service === "ADMIN_BROADCAST" || item.service === "USERBOT_PROMO") ? Boolean(item.enabled) : false,
+    updatedAt: item.updatedAt ?? now(),
+  }));
+  ready.broadcasts = (ready.broadcasts ?? []).map((item: any) => ({ ...item, executor: item.executor === "BUYER" ? "BUYER" : "ADMIN", mode: item.mode === "FORWARD" && item.forward ? "FORWARD" : "TEXT", forward: item.mode === "FORWARD" && item.forward ? { channel: String(item.forward.channel ?? ""), messageId: Number(item.forward.messageId), showSource: Boolean(item.forward.showSource) } : undefined, wording: String(item.wording ?? ""), intervalMinutes: broadcastInterval(item.intervalMinutes) }));
+  ready.lpmTargets = ready.lpmTargets.map((item: any) => ({ ...item, executor: item.executor === "BUYER" ? "BUYER" : "ADMIN" }));
+  ready.commentConfigs = (ready.commentConfigs ?? []).map((item: any) => ({ buyerId: item.buyerId, bases: item.bases ?? [], divisions: item.divisions ?? [{ id: id("division"), name: item.division ?? "Produk", keywords: item.keywords ?? [], blacklist: item.blacklist ?? [], wording: item.wording ?? "" }], mode: item.mode === "AUTO" ? "AUTO" : "APPROVAL", updatedAt: item.updatedAt ?? now(), updatedBy: item.updatedBy === "BUYER" ? "BUYER" : "ADMIN", ...(item.editingBy && item.editingUntil && Date.parse(item.editingUntil) > Date.now() ? { editingBy: item.editingBy === "BUYER" ? "BUYER" : "ADMIN", editingUntil: item.editingUntil } : {}) }));
+  ready.approvalCandidates = (ready.approvalCandidates ?? []).map((item: any) => ({ ...item, wording: String(item.wording ?? ready.commentConfigs.find((config) => config.buyerId === item.buyerId)?.divisions[0]?.wording ?? ""), preview: String(item.preview ?? "") }));
+  ready.commentJobs = ready.commentJobs.map((item: any) => ({ ...item, preview: String(item.preview ?? "") }));
+  for (const buyer of ready.buyers) {
+    buyer.planUserBroadcast ??= false; buyer.userBroadcastActive ??= false;
+    const oldPlans = ready.subscriptions.filter((item) => item.buyerId === buyer.id && !item.product);
+    if (oldPlans.some((item) => item.plan === "BROADCAST") && oldPlans.some((item) => item.plan === "COMMENT")) buyer.legacyBundle = true;
+  }
+  for (const worker of ready.workers) if (worker.status === "COOLDOWN") { worker.status = "AVAILABLE"; worker.buyerId = null; delete worker.cooldownUntil; }
+  for (const broadcast of ready.broadcasts.filter((item) => broadcastExecutor(item) === "ADMIN")) {
+    const buyer = ready.buyers.find((item) => item.id === broadcast.buyerId);
+    if (!buyer?.workerId || ready.lpmTargets.some((item) => item.buyerId === broadcast.buyerId && targetExecutor(item) === "ADMIN")) continue;
+    for (const username of broadcast.groups) ready.lpmTargets.push({ id: id("lpm"), buyerId: broadcast.buyerId, workerId: buyer.workerId, executor: "ADMIN", username, status: "READY", desired: true, createdAt: now(), updatedAt: now() });
+  }
+  return ready;
+}
 const incomingLeadLocks = new Set<string>();
 async function save(store: Store) {
   return savePersistentStore(dataFile, store);
@@ -148,23 +182,26 @@ function cleanGroups(value: unknown, maxGroups = Number.POSITIVE_INFINITY): stri
   if (groups.length > maxGroups) throw new Error(`Paket buyer ini mendukung hingga ${maxGroups} grup LPM.`);
   return groups;
 }
-function syncLpmTargets(store: Store, buyer: Buyer, worker: Worker, groups: string[]) {
+function targetExecutor(target: LpmTarget): Executor { return target.executor === "BUYER" ? "BUYER" : "ADMIN"; }
+function broadcastExecutor(broadcast: Broadcast): Executor { return broadcast.executor === "BUYER" ? "BUYER" : "ADMIN"; }
+function broadcastFor(store: Store, buyerId: string, executor: Executor) { return store.broadcasts.find((item) => item.buyerId === buyerId && broadcastExecutor(item) === executor); }
+function syncLpmTargets(store: Store, buyer: Buyer, executorId: string, executor: Executor, groups: string[]) {
   const wanted = new Set(groups.map((item) => item.toLowerCase()));
-  const current = store.lpmTargets.filter((item) => item.buyerId === buyer.id && item.desired);
+  const current = store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === executor && item.desired);
   for (const target of current) if (!wanted.has(target.username.toLowerCase())) { target.desired = false; target.status = "REMOVING"; target.note = undefined; target.updatedAt = now(); }
   for (const username of groups) {
-    const existing = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.username.toLowerCase() === username.toLowerCase());
+    const existing = store.lpmTargets.find((item) => item.buyerId === buyer.id && targetExecutor(item) === executor && item.username.toLowerCase() === username.toLowerCase());
     if (existing) {
-      const workerChanged = existing.workerId !== worker.id;
-      existing.desired = true; existing.workerId = worker.id;
+      const workerChanged = existing.workerId !== executorId;
+      existing.desired = true; existing.workerId = executorId; existing.executor = executor;
       if (workerChanged || existing.status === "REMOVING" || existing.status === "REMOVED" || existing.status === "READY" || existing.status === "UNAVAILABLE") { existing.status = "CONNECTING"; existing.note = undefined; }
       existing.updatedAt = now();
       continue;
     }
-    store.lpmTargets.push({ id: id("lpm"), buyerId: buyer.id, workerId: worker.id, username, status: "CONNECTING", desired: true, createdAt: now(), updatedAt: now() });
+    store.lpmTargets.push({ id: id("lpm"), buyerId: buyer.id, workerId: executorId, executor, username, status: "CONNECTING", desired: true, createdAt: now(), updatedAt: now() });
   }
 }
-function publicLpmTargets(store: Store, buyerId: string) { return store.lpmTargets.filter((item) => item.buyerId === buyerId && (item.desired || item.status === "REMOVING") && item.status !== "REMOVED").sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
+function publicLpmTargets(store: Store, buyerId: string, executor?: Executor) { return store.lpmTargets.filter((item) => item.buyerId === buyerId && (!executor || targetExecutor(item) === executor) && (item.desired || item.status === "REMOVING") && item.status !== "REMOVED").sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
 function notifyLpmStatus(store: Store, target: LpmTarget) {
   const buyer = store.buyers.find((item) => item.id === target.buyerId); if (!buyer?.telegramId || !bot) return;
   const text = ({ PENDING_APPROVAL: `@${target.username} menunggu persetujuan.`, READY: `@${target.username} siap dipakai.`, UNAVAILABLE: `@${target.username} tidak bisa dipakai.`, REMOVED: `@${target.username} dihapus.` } as Partial<Record<LpmTargetStatus, string>>)[target.status];
@@ -188,6 +225,9 @@ function unlockComment(config: CommentConfig, actor: CommentActor) { if (config.
 function broadcastLock(buyer: Buyer, actor: CommentActor) { const locked = buyer.broadcastEditingBy && buyer.broadcastEditingUntil && Date.parse(buyer.broadcastEditingUntil) > Date.now(); if (locked && buyer.broadcastEditingBy !== actor) throw new Error(buyer.broadcastEditingBy === "ADMIN" ? "Setup sedang diatur admin." : "Setup sedang diatur buyer."); buyer.broadcastEditingBy = actor; buyer.broadcastEditingUntil = new Date(Date.now() + 10 * 60_000).toISOString(); return buyer; }
 function requireBroadcastLock(buyer: Buyer, actor: CommentActor) { if (buyer.broadcastEditingBy !== actor || !buyer.broadcastEditingUntil || Date.parse(buyer.broadcastEditingUntil) <= Date.now()) throw new Error("Buka pengaturan dulu sebelum menyimpan."); }
 function unlockBroadcast(buyer: Buyer, actor: CommentActor) { if (buyer.broadcastEditingBy === actor) { delete buyer.broadcastEditingBy; delete buyer.broadcastEditingUntil; } }
+function userBroadcastLock(buyer: Buyer, actor: CommentActor) { const locked = buyer.userBroadcastEditingBy && buyer.userBroadcastEditingUntil && Date.parse(buyer.userBroadcastEditingUntil) > Date.now(); if (locked && buyer.userBroadcastEditingBy !== actor) throw new Error(buyer.userBroadcastEditingBy === "ADMIN" ? "Setup sedang diatur admin." : "Setup sedang diatur buyer."); buyer.userBroadcastEditingBy = actor; buyer.userBroadcastEditingUntil = new Date(Date.now() + 10 * 60_000).toISOString(); return buyer; }
+function requireUserBroadcastLock(buyer: Buyer, actor: CommentActor) { if (buyer.userBroadcastEditingBy !== actor || !buyer.userBroadcastEditingUntil || Date.parse(buyer.userBroadcastEditingUntil) <= Date.now()) throw new Error("Buka pengaturan dulu sebelum menyimpan."); }
+function unlockUserBroadcast(buyer: Buyer, actor: CommentActor) { if (buyer.userBroadcastEditingBy === actor) { delete buyer.userBroadcastEditingBy; delete buyer.userBroadcastEditingUntil; } }
 function scheduleNextBroadcast(broadcast: Broadcast, immediate = false) { broadcast.nextSendAt = immediate ? now() : new Date(Date.now() + broadcast.intervalMinutes * 60_000).toISOString(); broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; }
 function broadcastInterval(value: unknown) { return Math.max(1, Math.floor(Number(value) || 15)); }
 function cleanBroadcastWording(value: unknown) { const wording = String(value ?? ""); if (!wording.trim()) throw new Error("Isi wording promosi dulu."); if (Array.from(wording).length > 4096 || Buffer.byteLength(wording, "utf8") > 35_000) throw new Error("Wording terlalu panjang untuk dikirim Telegram."); return wording; }
@@ -197,7 +237,10 @@ function queueApprovedComment(store: Store, candidate: Candidate) { const job: C
 
 function hasPlanAccess(store: Store, buyer: Buyer, plan: Plan) {
   const subscriptions = store.subscriptions.filter((item) => item.buyerId === buyer.id && item.plan === plan);
-  return subscriptions.length ? subscriptions.some((item) => item.status === "ACTIVE" && Date.parse(item.endsAt) > Date.now()) : plan === "BROADCAST" ? buyer.planBroadcast : buyer.planComment;
+  if (subscriptions.length) return subscriptions.some((item) => item.status === "ACTIVE" && Date.parse(item.endsAt) > Date.now());
+  if (plan === "BROADCAST") return buyer.planBroadcast;
+  if (plan === "USERBOT_BROADCAST") return Boolean(buyer.planUserBroadcast);
+  return buyer.planComment;
 }
 function jakartaDateParts(value: Date) {
   const parts = new Intl.DateTimeFormat("en-US", { timeZone: "Asia/Jakarta", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(value);
@@ -235,9 +278,9 @@ function commerceFor(store: Store): Commerce {
   const withdrawals = [...store.withdrawals].sort((left, right) => Date.parse(right.paidAt ?? right.createdAt) - Date.parse(left.paidAt ?? left.createdAt)).slice(0, 20).map(({ id, grossAmount, fee, netAmount, walletType, walletNumber, walletOwner, status, createdAt, paidAt }) => ({ id, grossAmount, fee, netAmount, walletType, walletNumber, walletOwner, status, createdAt, paidAt }));
   return { today: total(paidOn((key) => key === today)), week: total(paidOn((key) => key >= weekStart && key <= today)), month: total(paidOn((key) => key.startsWith(month))), paidCount: paid.length, pendingBalance, availableBalance, requestedBalance, canRequestWithdrawal: withdrawWindowOpen(current) && availableBalance >= 30_000, orders, withdrawals };
 }
-function maxGroupsForBuyer(store: Store, buyer: Buyer) {
+function maxGroupsForBuyer(store: Store, buyer: Buyer, plan: "BROADCAST" | "USERBOT_BROADCAST" = "BROADCAST") {
   const active = store.subscriptions
-    .filter((item) => item.buyerId === buyer.id && item.plan === "BROADCAST" && item.status === "ACTIVE" && Date.parse(item.endsAt) > Date.now())
+    .filter((item) => item.buyerId === buyer.id && item.plan === plan && item.status === "ACTIVE" && Date.parse(item.endsAt) > Date.now())
     .sort((a, b) => Date.parse(b.endsAt) - Date.parse(a.endsAt))[0];
   return active ? Math.max(1, Number(active.maxGroups) || 1) : Number.POSITIVE_INFINITY;
 }
@@ -250,7 +293,7 @@ function releaseWorker(store: Store, buyer: Buyer) {
   buyer.workerId = null;
 }
 function releaseWorkerWhenGroupsCleared(store: Store, buyer: Buyer) {
-  const stillLeaving = store.lpmTargets.some((item) => item.buyerId === buyer.id && item.status !== "REMOVED");
+  const stillLeaving = store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.status !== "REMOVED");
   if (!stillLeaving) releaseWorker(store, buyer);
 }
 function cleanup(store: Store) {
@@ -260,10 +303,11 @@ function cleanup(store: Store) {
   for (const buyer of store.buyers) {
     const ownsSubscription = store.subscriptions.some((item) => item.buyerId === buyer.id);
     if (!ownsSubscription) continue;
-    if (!hasPlanAccess(store, buyer, "BROADCAST")) { buyer.planBroadcast = false; buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); }
-    if (!hasPlanAccess(store, buyer, "COMMENT")) { buyer.planComment = false; buyer.commentActive = false; buyer.commentAccountConnected = false; }
+    if (!hasPlanAccess(store, buyer, "BROADCAST")) { buyer.planBroadcast = false; buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); }
+    if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) { buyer.planUserBroadcast = false; buyer.userBroadcastActive = false; const broadcast = broadcastFor(store, buyer.id, "BUYER"); if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
+    if (!hasPlanAccess(store, buyer, "COMMENT")) { buyer.planComment = false; buyer.commentActive = false; if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) buyer.commentAccountConnected = false; }
   }
-  const expiredBuyerIds = new Set(store.buyers.filter((buyer) => !hasPlanAccess(store, buyer, "COMMENT")).map((buyer) => buyer.id));
+  const expiredBuyerIds = new Set(store.buyers.filter((buyer) => !hasPlanAccess(store, buyer, "COMMENT") && !hasPlanAccess(store, buyer, "USERBOT_BROADCAST")).map((buyer) => buyer.id));
   for (const job of store.commentJobs) if (expiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
   store.approvalCandidates = store.approvalCandidates.filter((item) => !expiredBuyerIds.has(item.buyerId));
   store.dedupe = store.dedupe.filter((item) => !expiredBuyerIds.has(item.buyerId));
@@ -289,8 +333,11 @@ async function reconcileRunners() {
     const commentSessions = await readCommentSessions();
     for (const buyerId of Object.keys(commentSessions)) {
       const buyer = store.buyers.find((item) => item.id === buyerId);
-      const configured = store.commentConfigs.some((item) => item.buyerId === buyerId);
-      if (buyer && configured && buyer.commentAccountConnected && hasPlanAccess(store, buyer, "COMMENT")) startCommentRunner(buyerId);
+      // Satu runner buyer mengelola dua modul Userbot Promosi. Jangan spawn runner
+      // kedua untuk Jaseb akun buyer karena dua koneksi dengan session yang sama bisa
+      // membuat Telegram menolak auth key atau mengirim dobel.
+      const allowed = Boolean(buyer && (hasPlanAccess(store, buyer, "COMMENT") || hasPlanAccess(store, buyer, "USERBOT_BROADCAST")));
+      if (buyer && buyer.commentAccountConnected && allowed) startCommentRunner(buyerId);
       else { stopCommentRunner(buyerId); await removeCommentSession(buyerId); if (buyer) buyer.commentAccountConnected = false; }
     }
     await save(store);
@@ -313,13 +360,16 @@ app.get("/api/buyer/dashboard", async (req, reply) => {
     }
   }
   if (changed) await save(store);
-  if (!buyer) return { onboarding: true, buyer: null, worker: null, broadcast: null, lpmTargets: [], commentTargets: [], comment: null, activity: [] };
+  if (!buyer) return { onboarding: true, buyer: null, worker: null, broadcast: null, userBroadcast: null, lpmTargets: [], userLpmTargets: [], commentTargets: [], comment: null, activity: [] };
   return {
     buyer,
-    broadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer); return Number.isFinite(quota) ? quota : null; })(),
+    broadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),
+    userBroadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),
     worker: buyer.workerId ? store.workers.find((item) => item.id === buyer.workerId) ?? null : null,
-    broadcast: (() => { const item = store.broadcasts.find((entry) => entry.buyerId === buyer.id); return item ? { ...item, maxGroups: maxGroupsForBuyer(store, buyer) } : null; })(),
-    lpmTargets: publicLpmTargets(store, buyer.id),
+    broadcast: (() => { const item = broadcastFor(store, buyer.id, "ADMIN"); return item ? { ...item, maxGroups: maxGroupsForBuyer(store, buyer, "BROADCAST") } : null; })(),
+    userBroadcast: (() => { const item = broadcastFor(store, buyer.id, "BUYER"); return item ? { ...item, maxGroups: maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST") } : null; })(),
+    lpmTargets: publicLpmTargets(store, buyer.id, "ADMIN"),
+    userLpmTargets: publicLpmTargets(store, buyer.id, "BUYER"),
     commentTargets: store.commentTargets.filter((item) => item.buyerId === buyer.id),
     comment: store.commentConfigs.find((item) => item.buyerId === buyer.id) ?? null,
     activity: store.activities.filter((item) => item.buyerId === buyer.id).sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 12),
@@ -363,25 +413,36 @@ async function pakasirTransaction(config: { project: string; apiKey: string }, p
 function activatePaidPackage(store: Store, payment: Payment) {
   const buyer = store.buyers.find((item) => item.telegramId === payment.telegramId);
   if (!buyer) throw new Error("Akun buyer tidak ditemukan.");
-  const plans: Plan[] = payment.plan === "BUNDLE" ? ["BROADCAST", "COMMENT"] : [payment.plan];
+  // Legacy bundle tetap dihormati, tetapi produk baru punya capability yang tegas:
+  // admin broadcast tak pernah menggunakan session buyer, sedangkan Userbot Promosi
+  // menyatukan broadcast akun buyer + Auto Komen dalam satu masa aktif.
+  const plans: Plan[] = payment.plan === "ADMIN_BROADCAST"
+    ? ["BROADCAST"]
+    : payment.plan === "USERBOT_PROMO"
+      ? ["USERBOT_BROADCAST", "COMMENT"]
+      : ["BROADCAST", "COMMENT"];
   const active = plans.map((plan) => store.subscriptions.find((item) => item.buyerId === buyer.id && item.plan === plan && item.status === "ACTIVE" && Date.parse(item.endsAt) > Date.now()));
   const extensionStart = Math.max(Date.now(), ...active.filter(Boolean).map((item) => Date.parse(item!.endsAt)));
   const startsAt = now();
   const endsAt = new Date(extensionStart + payment.durationDays * 86_400_000).toISOString();
+  const subscriptionProduct: Product = payment.plan === "BUNDLE" ? "LEGACY_BUNDLE" : payment.plan;
   for (const plan of plans) {
     const current = active.find((item) => item?.plan === plan);
-    const maxGroups = plan === "BROADCAST" ? payment.maxGroups : 15;
+    const maxGroups = plan === "BROADCAST" || plan === "USERBOT_BROADCAST" ? payment.maxGroups : 15;
     if (current) {
-      current.packageId = payment.packageId; current.maxGroups = maxGroups; current.endsAt = endsAt;
+      current.packageId = payment.packageId; current.product = subscriptionProduct; current.maxGroups = maxGroups; current.endsAt = endsAt;
     } else {
-      store.subscriptions.push({ id: id("subscription"), buyerId: buyer.id, packageId: payment.packageId, plan, maxGroups, status: "ACTIVE", startsAt, endsAt });
+      store.subscriptions.push({ id: id("subscription"), buyerId: buyer.id, packageId: payment.packageId, plan, product: subscriptionProduct, maxGroups, status: "ACTIVE", startsAt, endsAt });
     }
   }
   if (plans.includes("BROADCAST")) buyer.planBroadcast = true;
+  if (plans.includes("USERBOT_BROADCAST")) buyer.planUserBroadcast = true;
   if (plans.includes("COMMENT")) buyer.planComment = true;
+  if (payment.plan !== "LEGACY_BUNDLE") buyer.legacyBundle = false;
   buyer.updatedAt = now();
   payment.status = "PAID"; payment.paidAt = now();
-  sendBuyerAlert(store, buyer.id, "Pembayaran berhasil", `${payment.plan === "BUNDLE" ? "Paket Promosi" : payment.plan === "BROADCAST" ? "Auto Sebar" : "Auto Komen MF"} aktif sampai ${new Date(endsAt).toLocaleDateString("id-ID")}.`);
+  const label = payment.plan === "ADMIN_BROADCAST" ? "Auto Sebar" : payment.plan === "USERBOT_PROMO" ? "Userbot Promosi" : "Paket Promosi";
+  sendBuyerAlert(store, buyer.id, "Pembayaran berhasil", `${label} aktif sampai ${new Date(endsAt).toLocaleDateString("id-ID")}.`);
 }
 app.post<{ Body: { packageId?: string } }>("/api/public/checkout", async (req, reply) => {
   if (!selfServiceSubscriptionsEnabled) return reply.code(503).send({ error: "subscriptions_closed", reason: "Langganan sementara ditutup. Hubungi admin @Kertaaji untuk pengaktifan layanan." });
@@ -404,15 +465,21 @@ app.get<{ Querystring: { orderId?: string } }>("/api/buyer/payment-result", asyn
   return { status: payment.status, plan: payment.plan, durationDays: payment.durationDays };
 });
 
-app.post<{ Body: { feature: "BROADCAST" | "COMMENT"; active: boolean } }>("/api/buyer/toggle", async (req, reply) => {
+app.post<{ Body: { feature: "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT"; active: boolean } }>("/api/buyer/toggle", async (req, reply) => {
   const store = await load(); cleanup(store); await save(store); const buyer = buyerForRequest(store, req);
   if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Layanan belum disiapkan untuk akun Telegram ini." });
   const feature = req.body.feature;
   if (feature === "BROADCAST") {
-    const ready = hasPlanAccess(store, buyer, "BROADCAST") && buyer.workerId && store.broadcasts.some((item) => item.buyerId === buyer.id) && store.lpmTargets.some((item) => item.buyerId === buyer.id && item.desired && item.status === "READY");
+    const ready = hasPlanAccess(store, buyer, "BROADCAST") && buyer.workerId && Boolean(broadcastFor(store, buyer.id, "ADMIN")) && store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired && item.status === "READY");
     if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: "Belum ada grup yang siap dipakai." });
     buyer.broadcastActive = req.body.active;
-    const broadcast = store.broadcasts.find((item) => item.buyerId === buyer.id);
+    const broadcast = broadcastFor(store, buyer.id, "ADMIN");
+    if (broadcast) { if (req.body.active) scheduleNextBroadcast(broadcast, true); else { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
+  } else if (feature === "USERBOT_BROADCAST") {
+    const ready = hasPlanAccess(store, buyer, "USERBOT_BROADCAST") && buyer.commentAccountConnected && Boolean(broadcastFor(store, buyer.id, "BUYER")) && store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.desired && item.status === "READY");
+    if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: "Hubungkan akun dan siapkan grup LPM dulu." });
+    buyer.userBroadcastActive = req.body.active;
+    const broadcast = broadcastFor(store, buyer.id, "BUYER");
     if (broadcast) { if (req.body.active) scheduleNextBroadcast(broadcast, true); else { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
   } else {
     const ready = hasPlanAccess(store, buyer, "COMMENT") && buyer.commentAccountConnected && store.commentConfigs.some((item) => item.buyerId === buyer.id);
@@ -434,10 +501,62 @@ app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: str
   if (worker.status !== "AVAILABLE" && worker.buyerId !== buyer.id) return reply.code(409).send({ error: "worker_unavailable", reason: "Akun kerja belum tersedia. Hubungi admin." });
   for (const item of store.workers) if (item.buyerId === buyer.id && item.id !== worker.id) { item.buyerId = null; item.status = "AVAILABLE"; }
   worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
-  syncLpmTargets(store, buyer, worker, groups);
-  const broadcast: Broadcast = { buyerId: buyer.id, ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
-  store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id), broadcast]; buyer.updatedAt = now(); await save(store);
+  syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
+  const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
+  store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; buyer.updatedAt = now(); await save(store);
   return { ok: true, broadcast };
+});
+
+// Userbot Promosi menggunakan satu session buyer untuk Auto Jaseb dan Auto Komen.
+// Session itu wajib sudah tersambung, tetapi tak pernah menyentuh worker/admin pool.
+app.post("/api/buyer/userbot-broadcast/edit", async (req, reply) => {
+  const store = await load(); const buyer = buyerForRequest(store, req);
+  if (!buyer) return reply.code(404).send({ error: "buyer_not_found" });
+  if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
+  try { userBroadcastLock(buyer, "BUYER"); await save(store); return { ok: true, buyer }; }
+  catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
+});
+app.post("/api/buyer/userbot-broadcast/cancel", async (req, reply) => {
+  const store = await load(); const buyer = buyerForRequest(store, req); if (buyer) unlockUserBroadcast(buyer, "BUYER"); await save(store); return { ok: true };
+});
+app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number } }>("/api/buyer/userbot-broadcast-setup", async (req, reply) => {
+  const store = await load(); cleanup(store); const buyer = buyerForRequest(store, req);
+  if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Akun buyer belum ditemukan." });
+  if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
+  if (!buyer.commentAccountConnected) return reply.code(409).send({ error: "account_required", reason: "Hubungkan akun Telegram lo sekali dulu untuk memakai Userbot Promosi." });
+  try { requireUserBroadcastLock(buyer, "BUYER"); } catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
+  let content: ReturnType<typeof broadcastContent>; try { content = broadcastContent(req.body ?? {}); } catch (error) { return reply.code(400).send({ error: "wording_invalid", reason: (error as Error).message }); }
+  let groups: string[]; try { groups = cleanGroups(req.body?.groups, maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST")); } catch (error) { return reply.code(400).send({ error: "groups_invalid", reason: (error as Error).message }); }
+  syncLpmTargets(store, buyer, buyer.id, "BUYER", groups);
+  const broadcast: Broadcast = { buyerId: buyer.id, executor: "BUYER", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
+  store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "BUYER"), broadcast]; unlockUserBroadcast(buyer, "BUYER"); buyer.updatedAt = now(); await save(store);
+  return { ok: true, broadcast };
+});
+
+// Admin dan buyer berbagi mekanisme lock yang sama. Admin boleh menyiapkan
+// Auto Jaseb milik buyer, tetapi tidak pernah menerima atau menyimpan session
+// buyer lewat jalur ini.
+app.post<{ Params: { id: string } }>("/api/admin/buyers/:id/userbot-broadcast-config/edit", { preHandler: adminOnly }, async (req, reply) => {
+  const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
+  if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Buyer tidak ditemukan." });
+  if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
+  try { userBroadcastLock(buyer, "ADMIN"); await save(store); return { ok: true, buyer }; }
+  catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
+});
+app.post<{ Params: { id: string } }>("/api/admin/buyers/:id/userbot-broadcast-config/cancel", { preHandler: adminOnly }, async (req) => {
+  const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id); if (buyer) unlockUserBroadcast(buyer, "ADMIN"); await save(store); return { ok: true };
+});
+app.put<{ Params: { id: string }; Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number } }>("/api/admin/buyers/:id/userbot-broadcast-config", { preHandler: adminOnly }, async (req, reply) => {
+  const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
+  if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Buyer tidak ditemukan." });
+  if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
+  try { requireUserBroadcastLock(buyer, "ADMIN"); } catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
+  let content: ReturnType<typeof broadcastContent>; try { content = broadcastContent(req.body ?? {}); } catch (error) { return reply.code(400).send({ error: "wording_invalid", reason: (error as Error).message }); }
+  let groups: string[]; try { groups = cleanGroups(req.body?.groups, maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST")); } catch (error) { return reply.code(400).send({ error: "groups_invalid", reason: (error as Error).message }); }
+  syncLpmTargets(store, buyer, buyer.id, "BUYER", groups);
+  const broadcast: Broadcast = { buyerId: buyer.id, executor: "BUYER", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
+  store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "BUYER"), broadcast]; unlockUserBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
+  return { ok: true, buyer, broadcast };
 });
 
 app.post("/api/buyer/comment-config/edit", async (req, reply) => {
@@ -470,6 +589,11 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/lpm-jobs", { preH
   const workerId = String(req.query.workerId ?? ""); const store = await load();
   return { jobs: store.lpmTargets.filter((item) => item.workerId === workerId && ((item.desired && item.status === "CONNECTING") || (!item.desired && item.status === "REMOVING"))).map((item) => ({ id: item.id, action: item.desired ? "JOIN" : "LEAVE", username: item.username })) };
 });
+app.get<{ Querystring: { buyerId?: string } }>("/api/internal/userbot-lpm-monitor", { preHandler: lpmAdapterOnly }, async (req, reply) => {
+  const buyerId = String(req.query.buyerId ?? ""); const store = await load(); const buyer = store.buyers.find((item) => item.id === buyerId);
+  if (!buyer || !buyer.commentAccountConnected || !hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return reply.code(404).send({ error: "userbot_not_ready" });
+  return { targets: store.lpmTargets.filter((item) => item.buyerId === buyerId && targetExecutor(item) === "BUYER" && item.desired).map((item) => ({ id: item.id, username: item.username, status: item.status })) };
+});
 app.post<{ Params: { id: string }; Body: { workerId?: string; action?: "JOIN" | "LEAVE" } }>("/api/internal/lpm-targets/:id/confirm", { preHandler: lpmAdapterOnly }, async (req) => {
   const store = await load(); const target = store.lpmTargets.find((item) => item.id === req.params.id); const workerId = String(req.body?.workerId ?? ""); const action = req.body?.action;
   return { execute: Boolean(target && target.workerId === workerId && ((action === "JOIN" && target.desired && target.status === "CONNECTING") || (action === "LEAVE" && !target.desired && target.status === "REMOVING"))) };
@@ -487,6 +611,7 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/broadcast-jobs", 
   const workerId = String(req.query.workerId ?? ""); const store = await load(); cleanup(store);
   const jobs: { buyerId: string; deliveryToken: string; group: string; wording: string; mode: Broadcast["mode"]; forward?: ForwardSource }[] = [];
   for (const broadcast of store.broadcasts) {
+    if (broadcastExecutor(broadcast) !== "ADMIN") continue;
     const buyer = store.buyers.find((item) => item.id === broadcast.buyerId);
     if (!buyer || buyer.workerId !== workerId || !buyer.broadcastActive || !hasPlanAccess(store, buyer, "BROADCAST")) continue;
     if (broadcast.deliveryToken && broadcast.deliveryUntil && Date.parse(broadcast.deliveryUntil) > Date.now()) continue;
@@ -500,7 +625,7 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/broadcast-jobs", 
 });
 
 app.post<{ Params: { id: string }; Body: { deliveryToken?: string; workerId?: string; group?: string } }>("/api/internal/broadcast-jobs/:id/confirm", { preHandler: lpmAdapterOnly }, async (req) => {
-  const store = await load(); cleanup(store); const broadcast = store.broadcasts.find((item) => item.buyerId === req.params.id); const buyer = store.buyers.find((item) => item.id === req.params.id); const workerId = String(req.body?.workerId ?? ""); const group = String(req.body?.group ?? "").replace(/^@/, "").toLowerCase();
+  const store = await load(); cleanup(store); const broadcast = broadcastFor(store, req.params.id, "ADMIN"); const buyer = store.buyers.find((item) => item.id === req.params.id); const workerId = String(req.body?.workerId ?? ""); const group = String(req.body?.group ?? "").replace(/^@/, "").toLowerCase();
   const targetReady = Boolean(buyer && store.lpmTargets.some((item) => item.buyerId === buyer.id && item.workerId === workerId && item.desired && item.status === "READY" && item.username.toLowerCase() === group));
   const allowed = Boolean(broadcast && buyer && broadcast.deliveryToken === String(req.body?.deliveryToken ?? "") && buyer.workerId === workerId && buyer.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
   if (!allowed && broadcast?.deliveryToken === String(req.body?.deliveryToken ?? "")) { broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; if (buyer?.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST")) scheduleNextBroadcast(broadcast, true); await save(store); }
@@ -508,12 +633,48 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; workerId?: st
 });
 
 app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: string; messageId?: number; error?: string } }>("/api/internal/broadcast-jobs/:id/result", { preHandler: lpmAdapterOnly }, async (req, reply) => {
-  const store = await load(); const broadcast = store.broadcasts.find((item) => item.buyerId === req.params.id); const buyer = store.buyers.find((item) => item.id === req.params.id);
+  const store = await load(); const broadcast = broadcastFor(store, req.params.id, "ADMIN"); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!broadcast || !buyer || broadcast.deliveryToken !== String(req.body?.deliveryToken ?? "")) return reply.code(409).send({ error: "delivery_not_found" });
   const group = String(req.body?.group ?? "").replace(/^@/, ""); const failed = String(req.body?.error ?? "").trim(); const messageId = Number(req.body?.messageId);
   broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; broadcast.lastGroup = group || broadcast.lastGroup; broadcast.groupCursor = Math.max(0, Number(broadcast.groupCursor) || 0) + 1; scheduleNextBroadcast(broadcast);
   if (failed) { store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() }); if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.username.toLowerCase() === group.toLowerCase()); if (target) { target.status = "UNAVAILABLE"; target.note = "Akun worker tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun worker tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); } else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain."); else if (/CHANNEL_PRIVATE|MESSAGE_ID_INVALID|MSG_ID_INVALID/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Link forward tidak bisa diakses akun worker. Pastikan post berasal dari channel publik dan link-nya benar."); else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`); }
   else { broadcast.lastSentAt = now(); const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
+  cleanup(store); await save(store); return { ok: true, nextSendAt: broadcast.nextSendAt };
+});
+
+// Jalur kirim khusus Userbot Promosi. Sengaja dipisah dari endpoint worker agar
+// akun buyer tidak pernah bisa mengambil job yang dialokasikan untuk akun admin.
+app.get<{ Querystring: { buyerId?: string } }>("/api/internal/userbot-broadcast-jobs", { preHandler: lpmAdapterOnly }, async (req) => {
+  const buyerId = String(req.query.buyerId ?? ""); const store = await load(); cleanup(store);
+  const buyer = store.buyers.find((item) => item.id === buyerId); const broadcast = broadcastFor(store, buyerId, "BUYER");
+  if (!buyer || !broadcast || !buyer.userBroadcastActive || !buyer.commentAccountConnected || !hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return { jobs: [] };
+  if (broadcast.deliveryToken && broadcast.deliveryUntil && Date.parse(broadcast.deliveryUntil) > Date.now()) return { jobs: [] };
+  if (!broadcast.nextSendAt || Date.parse(broadcast.nextSendAt) > Date.now()) return { jobs: [] };
+  const readyGroups = broadcast.groups.filter((username) => store.lpmTargets.some((target) => target.buyerId === buyer.id && targetExecutor(target) === "BUYER" && target.workerId === buyer.id && target.desired && target.status === "READY" && target.username.toLowerCase() === username.toLowerCase()));
+  if (!readyGroups.length) return { jobs: [] };
+  const cursor = Math.max(0, Number(broadcast.groupCursor) || 0) % readyGroups.length; const group = readyGroups[cursor]; const deliveryToken = id("send");
+  broadcast.deliveryToken = deliveryToken; broadcast.deliveryUntil = new Date(Date.now() + 2 * 60_000).toISOString(); await save(store);
+  return { jobs: [{ buyerId: buyer.id, deliveryToken, group, wording: broadcast.wording, mode: broadcast.mode, forward: broadcast.forward }] };
+});
+app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: string } }>("/api/internal/userbot-broadcast-jobs/:id/confirm", { preHandler: lpmAdapterOnly }, async (req) => {
+  const store = await load(); cleanup(store); const buyer = store.buyers.find((item) => item.id === req.params.id); const broadcast = broadcastFor(store, req.params.id, "BUYER"); const group = String(req.body?.group ?? "").replace(/^@/, "").toLowerCase();
+  const targetReady = Boolean(buyer && store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.workerId === buyer.id && item.desired && item.status === "READY" && item.username.toLowerCase() === group));
+  const allowed = Boolean(broadcast && buyer && broadcast.deliveryToken === String(req.body?.deliveryToken ?? "") && buyer.userBroadcastActive && buyer.commentAccountConnected && hasPlanAccess(store, buyer, "USERBOT_BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
+  if (!allowed && broadcast?.deliveryToken === String(req.body?.deliveryToken ?? "")) { broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; if (buyer?.userBroadcastActive && hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) scheduleNextBroadcast(broadcast, true); await save(store); }
+  return { send: allowed };
+});
+app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: string; messageId?: number; error?: string } }>("/api/internal/userbot-broadcast-jobs/:id/result", { preHandler: lpmAdapterOnly }, async (req, reply) => {
+  const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id); const broadcast = broadcastFor(store, req.params.id, "BUYER");
+  if (!broadcast || !buyer || broadcast.deliveryToken !== String(req.body?.deliveryToken ?? "")) return reply.code(409).send({ error: "delivery_not_found" });
+  const group = String(req.body?.group ?? "").replace(/^@/, ""); const failed = String(req.body?.error ?? "").trim(); const messageId = Number(req.body?.messageId);
+  broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; broadcast.lastGroup = group || broadcast.lastGroup; broadcast.groupCursor = Math.max(0, Number(broadcast.groupCursor) || 0) + 1; scheduleNextBroadcast(broadcast);
+  if (failed) {
+    store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() });
+    const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.username.toLowerCase() === group.toLowerCase());
+    if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { if (target) { target.status = "UNAVAILABLE"; target.note = "Akun lo tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Jaseb · @${group}`, "Akun lo tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); }
+    else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Jaseb · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain.");
+    else sendBuyerAlert(store, buyer.id, `Info Auto Jaseb · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`);
+  } else { broadcast.lastSentAt = now(); const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
   cleanup(store); await save(store); return { ok: true, nextSendAt: broadcast.nextSendAt };
 });
 
@@ -538,10 +699,11 @@ app.post<{ Body: { buyerId?: string; base?: string; discussion?: string; status?
 app.post<{ Body: { buyerId?: string; workerId?: string; chat?: string; type?: "MENTION" | "REPLY" | "MUTED"; text?: string; link?: string } }>("/api/internal/operational-alert", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const buyerId = String(req.body?.buyerId ?? ""); const chat = String(req.body?.chat ?? "").replace(/^@/, "").toLowerCase(); const type = req.body?.type; const store = await load(); const buyer = store.buyers.find((item) => item.id === buyerId);
   if (!buyer || !chat || !type) return reply.code(400).send({ error: "alert_invalid" });
-  const workerId = String(req.body?.workerId ?? ""); const isWorkerSource = workerId && buyer.workerId === workerId && store.lpmTargets.some((item) => item.buyerId === buyerId && item.username.toLowerCase() === chat);
+  const workerId = String(req.body?.workerId ?? ""); const isWorkerSource = workerId && buyer.workerId === workerId && store.lpmTargets.some((item) => item.buyerId === buyerId && targetExecutor(item) === "ADMIN" && item.username.toLowerCase() === chat);
+  const isUserbotBroadcastSource = workerId === buyer.id && store.lpmTargets.some((item) => item.buyerId === buyerId && targetExecutor(item) === "BUYER" && item.username.toLowerCase() === chat);
   const isCommentSource = !workerId && store.commentTargets.some((item) => item.buyerId === buyerId && (item.base.toLowerCase() === chat || item.discussion?.toLowerCase() === chat));
-  if (!isWorkerSource && !isCommentSource) return reply.code(403).send({ error: "alert_source_invalid" });
-  const title = type === "MUTED" ? `Info · @${chat}` : type === "MENTION" ? `Akun lo di-tag di @${chat}` : `Ada balasan di @${chat}`; const snippet = String(req.body?.text ?? "").trim().replace(/\s+/g, " ").slice(0, 500);
+  if (!isWorkerSource && !isUserbotBroadcastSource && !isCommentSource) return reply.code(403).send({ error: "alert_source_invalid" });
+  const accountLabel = isWorkerSource ? "Akun promosi" : "Akun lo"; const title = type === "MUTED" ? `Info · @${chat}` : type === "MENTION" ? `${accountLabel} di-tag di @${chat}` : `Ada balasan di @${chat}`; const snippet = String(req.body?.text ?? "").trim().replace(/\s+/g, " ").slice(0, 500);
   sendBuyerAlert(store, buyerId, title, snippet || (type === "MUTED" ? "Akun tidak bisa mengirim di target ini." : "Buka pesan untuk melihat detailnya."), String(req.body?.link ?? "") || undefined); return { ok: true };
 });
 
@@ -711,19 +873,22 @@ app.post("/api/admin/withdrawals", { preHandler: adminOnly }, async (req, reply)
 
 app.get("/api/health", async () => ({ ok: true, bot: botPollingStatus }));
 
-function validatePackage(input: { name?: string; price?: number; durationDays?: number; maxGroups?: number; enabled?: boolean }): Omit<Package, "id" | "updatedAt"> {
+function validatePackage(input: { service?: Product; name?: string; price?: number; durationDays?: number; maxGroups?: number; enabled?: boolean }): Omit<Package, "id" | "updatedAt"> {
+  const service = input.service;
+  if (service !== "ADMIN_BROADCAST" && service !== "USERBOT_PROMO") throw new Error("Pilih produk paket.");
   const price = Math.max(0, Math.floor(Number(input.price) || 0)); const durationDays = Math.max(1, Math.min(365, Math.floor(Number(input.durationDays) || 30))); const maxGroups = Math.floor(Number(input.maxGroups) || 15);
   if (price > 10_000_000) throw new Error("Isi harga dan masa aktif paket dengan benar.");
   if (maxGroups < 1) throw new Error("Jumlah LPM minimal 1.");
   if (input.enabled && price < 1) throw new Error("Isi harga sebelum membuka paket untuk buyer.");
-  return { service: "BUNDLE", name: `${durationDays} Hari · ${maxGroups} LPM`, price, durationDays, maxGroups, enabled: Boolean(input.enabled) };
+  const productName = service === "ADMIN_BROADCAST" ? "Auto Sebar" : "Userbot Promosi";
+  return { service, name: String(input.name ?? "").trim() || `${productName} · ${durationDays} Hari`, price, durationDays, maxGroups, enabled: Boolean(input.enabled) };
 }
-app.post<{ Body: { name?: string; price?: number; durationDays?: number; maxGroups?: number; enabled?: boolean } }>("/api/admin/packages", { preHandler: adminOnly }, async (req, reply) => {
-  try { const value = validatePackage(req.body); const store = await load(); if (store.packages.some((item) => item.durationDays === value.durationDays && item.maxGroups === value.maxGroups)) return reply.code(409).send({ error: "Pilihan paket ini sudah ada." }); const item: Package = { id: id("package"), ...value, updatedAt: now() }; store.packages.push(item); await save(store); return { package: item }; }
+app.post<{ Body: { service?: Product; name?: string; price?: number; durationDays?: number; maxGroups?: number; enabled?: boolean } }>("/api/admin/packages", { preHandler: adminOnly }, async (req, reply) => {
+  try { const value = validatePackage(req.body); const store = await load(); if (store.packages.some((item) => item.service === value.service && item.durationDays === value.durationDays && item.maxGroups === value.maxGroups)) return reply.code(409).send({ error: "Pilihan paket ini sudah ada." }); const item: Package = { id: id("package"), ...value, updatedAt: now() }; store.packages.push(item); await save(store); return { package: item }; }
   catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
 });
-app.put<{ Params: { id: string }; Body: { name?: string; price?: number; durationDays?: number; maxGroups?: number; enabled?: boolean } }>("/api/admin/packages/:id", { preHandler: adminOnly }, async (req, reply) => {
-  try { const value = validatePackage(req.body); const store = await load(); const item = store.packages.find((entry) => entry.id === req.params.id); if (!item) return reply.code(404).send({ error: "Paket tidak ditemukan." }); if (store.packages.some((entry) => entry.id !== item.id && entry.durationDays === value.durationDays && entry.maxGroups === value.maxGroups)) return reply.code(409).send({ error: "Pilihan paket ini sudah ada." }); Object.assign(item, value, { updatedAt: now() }); await save(store); return { package: item }; }
+app.put<{ Params: { id: string }; Body: { service?: Product; name?: string; price?: number; durationDays?: number; maxGroups?: number; enabled?: boolean } }>("/api/admin/packages/:id", { preHandler: adminOnly }, async (req, reply) => {
+  try { const store = await load(); const item = store.packages.find((entry) => entry.id === req.params.id); if (!item) return reply.code(404).send({ error: "Paket tidak ditemukan." }); const value = validatePackage({ ...req.body, service: item.service }); if (store.packages.some((entry) => entry.id !== item.id && entry.service === value.service && entry.durationDays === value.durationDays && entry.maxGroups === value.maxGroups)) return reply.code(409).send({ error: "Pilihan paket ini sudah ada." }); Object.assign(item, value, { updatedAt: now() }); await save(store); return { package: item }; }
   catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
 });
 app.delete<{ Params: { id: string } }>("/api/admin/packages/:id", { preHandler: adminOnly }, async (req, reply) => {
@@ -805,10 +970,10 @@ app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?
     let groups: string[]; try { groups = cleanGroups(req.body.groups, maxGroupsForBuyer(store, buyer)); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
     for (const item of store.workers) if (item.buyerId === buyer.id && item.id !== worker.id) { item.buyerId = null; item.status = "AVAILABLE"; }
     worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
-    syncLpmTargets(store, buyer, worker, groups);
-    const broadcast: Broadcast = { buyerId: buyer.id, ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
-    store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id), broadcast];
-  } else { buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id); }
+    syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
+    const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
+    store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast];
+  } else { buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"); }
   if (buyer.planComment) {
     let divisions: CommentDivision[]; try { divisions = cleanDivisions(req.body.divisions); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
     const config: CommentConfig = { buyerId: buyer.id, bases: split(req.body.bases), divisions, mode: req.body.mode === "AUTO" ? "AUTO" : "APPROVAL", updatedAt: now(), updatedBy: "ADMIN" };
@@ -824,8 +989,8 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; 
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
   if (!req.body.enabled) {
     buyer.planBroadcast = false; buyer.broadcastActive = false; unlockBroadcast(buyer, "ADMIN");
-    for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); }
-    releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id);
+    for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); }
+    releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN");
     buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
   }
   if (!req.body.workerId) {
@@ -839,9 +1004,9 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; 
   let groups: string[]; try { groups = cleanGroups(req.body.groups, maxGroupsForBuyer(store, buyer)); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
   for (const item of store.workers) if (item.buyerId === buyer.id && item.id !== worker.id) { item.buyerId = null; item.status = "AVAILABLE"; }
   worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id; buyer.planBroadcast = true;
-  syncLpmTargets(store, buyer, worker, groups);
-  const broadcast: Broadcast = { buyerId: buyer.id, ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
-  store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id), broadcast]; unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
+  syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
+  const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
+  store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
   return { ok: true, buyer, broadcast };
 });
 
@@ -868,18 +1033,18 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; bases?: string; div
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
   if (!req.body.enabled) {
-    buyer.planComment = false; buyer.commentActive = false; store.commentConfigs = store.commentConfigs.filter((item) => item.buyerId !== buyer.id);
+    buyer.planComment = false; buyer.planUserBroadcast = false; buyer.commentActive = false; buyer.userBroadcastActive = false; store.commentConfigs = store.commentConfigs.filter((item) => item.buyerId !== buyer.id);
     buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
   }
   const bases = split(req.body.bases);
   if (!bases.length) {
-    buyer.planComment = true; buyer.updatedAt = now(); await save(store);
+    buyer.planComment = true; buyer.planUserBroadcast = true; buyer.updatedAt = now(); await save(store);
     return { ok: true, buyer };
   }
   const current = commentConfigFor(store, buyer.id);
   try { requireCommentLock(current, "ADMIN"); } catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
   let divisions: CommentDivision[]; try { divisions = cleanDivisions(req.body.divisions); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
-  buyer.planComment = true;
+  buyer.planComment = true; buyer.planUserBroadcast = true;
   current.bases = bases; current.divisions = divisions; current.mode = req.body.mode === "AUTO" ? "AUTO" : "APPROVAL"; current.updatedAt = now(); current.updatedBy = "ADMIN"; unlockComment(current, "ADMIN"); syncCommentTargets(store, buyer.id, current.bases); buyer.updatedAt = now(); await save(store);
   const config = current;
   return { ok: true, buyer, config };
