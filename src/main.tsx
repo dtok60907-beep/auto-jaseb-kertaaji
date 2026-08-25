@@ -80,7 +80,7 @@ function PackageStore({ onBack }: { onBack: () => void }) {
   const checkout = async (item: PublicPackage) => {
     setBusyId(item.packageId); setError(""); setNotice("");
     try {
-      const result = await api<{ paymentUrl: string }>("/api/public/checkout", { method: "POST", body: JSON.stringify({ packageId: item.packageId }) });
+      const result = await api<{ paymentUrl: string }>("/api/public/checkout", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ packageId: item.packageId }) });
       setNotice("Membuka halaman pembayaran…");
       const url = result.paymentUrl;
       if (telegramApp?.openLink) telegramApp.openLink(url); else window.open(url, "_blank");
