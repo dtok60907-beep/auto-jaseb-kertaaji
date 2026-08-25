@@ -116,7 +116,7 @@ export async function runBuyerSession(buyerId: string, isStillWanted: () => bool
     catch (error) {
       if (!sessionInvalid(error)) throw error;
       const reason = errorText(error).slice(0, 160);
-      console.error(JSON.stringify({ event: "userbot-fatal", buyerId, error: reason }));
+      console.log(JSON.stringify({ event: "userbot-fatal", buyerId, error: reason }));
       await accountStatus("RECONNECT_REQUIRED", "Sesi akun sudah tidak aktif.");
       throw new Error("Session Auto Komen sudah tidak aktif.");
     }
