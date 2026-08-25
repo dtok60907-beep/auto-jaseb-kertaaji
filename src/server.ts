@@ -200,10 +200,11 @@ function startUserbotRunner() {
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
-        const message = JSON.parse(line) as { event?: string; buyerId?: string; error?: string };
+        const message = JSON.parse(line) as { event?: string; buyerId?: string; error?: string; level?: string; message?: string };
         if (message.event === "userbot-connected") app.log.info({ buyerId: message.buyerId ?? null }, "🟢 Akun userbot tersambung");
         else if (message.event === "userbot-disconnected") app.log.info({ buyerId: message.buyerId ?? null }, "🛑 Akun userbot terputus");
         else if (message.event === "userbot-exited" || message.event === "userbot-fatal") app.log.warn({ buyerId: message.buyerId ?? null, error: message.error ?? null }, "Sesi akun userbot berhenti; dicoba lagi setelah jeda");
+        else if (message.event === "gramjs") app.log.warn({ level: message.level ?? null, detail: message.message ?? null }, "Peringatan GramJS dari host userbot");
         else app.log.info({ raw: line.slice(0, 220) }, "Pesan host userbot");
       } catch { app.log.warn({ raw: line.slice(0, 220) }, "Baris tak terbaca dari host userbot"); }
     }

@@ -30,6 +30,9 @@ class QuietGramJsLogger extends Logger {
   log() { /* tidak pernah cetak langsung; lewat handler */ }
 }
 const quietLogger = new QuietGramJsLogger();
+// Peringatan/error GramJS tetap harus kelihatan saat diagnosis — dikirim sebagai
+// baris JSON ke stdout supaya server bisa mencatatnya dengan konteks yang benar.
+quietLogger.handler = (record) => { try { console.log(JSON.stringify({ event: "gramjs", level: record.level, message: String(record.message ?? "").slice(0, 200) })); } catch {} };
 
 type Target = { base: string; discussion?: string; status: string; baseId?: string; discussionId?: string; baseInput?: any; discussionInput?: any };
 type CommentJob = { id: string; deliveryToken: string; base: string; messageId: string; wording: string; link: string };
@@ -139,8 +142,8 @@ if (process.argv[1] && process.argv[1].endsWith("userbot-runner.ts")) {
       if (live.has(buyerId)) continue;
       if ((retryAt.get(buyerId) ?? 0) > Date.now()) continue;
       const task = (async () => {
-        try { await runBuyerSession(buyerId, () => wanted.has(buyerId)); retryAt.set(buyerId, Date.now() + 15_000); }
-        catch (error) { console.error(JSON.stringify({ event: "userbot-exited", buyerId, error: String((error as Error)?.message ?? error).slice(0, 200) })); retryAt.set(buyerId, Date.now() + 30_000); }
+        try { await runBuyerSession(buyerId, () => wanted.has(buyerId)); console.log(JSON.stringify({ event: "userbot-connected", buyerId })); retryAt.set(buyerId, Date.now() + 15_000); }
+        catch (error) { console.log(JSON.stringify({ event: "userbot-exited", buyerId, error: String((error as Error)?.message ?? error).slice(0, 200) })); retryAt.set(buyerId, Date.now() + 30_000); }
       })();
       live.set(buyerId, task);
       task.finally(() => live.delete(buyerId));
