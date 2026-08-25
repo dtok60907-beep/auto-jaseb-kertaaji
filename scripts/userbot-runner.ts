@@ -70,7 +70,7 @@ const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 function normalizedChatId(value: unknown) { let raw = String(value ?? ""); if (raw.startsWith("-100")) raw = raw.slice(4); else if (raw.startsWith("-")) raw = raw.slice(1); return raw; }
 function targetStatus(error: unknown): "PENDING_APPROVAL" | "UNAVAILABLE" { const message = String((error as Error).message ?? error); return message.includes("INVITE_REQUEST_SENT") ? "PENDING_APPROVAL" : "UNAVAILABLE"; }
 function errorText(error: unknown) { return String((error as Error)?.message ?? error ?? ""); }
-function sessionInvalid(error: unknown) { return /AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED|SESSION_REVOKED|USER_DEACTIVATED|USER_DEACTIVATED_BAN/i.test(errorText(error)); }
+function sessionInvalid(error: unknown) { return /AUTH_KEY_UNREGISTERED|AUTH_KEY_DUPLICATED|SESSION_REVOKED|USER_DEACTIVATED|USER_DEACTIVATED_BAN|CONCURRENT USAGE OF THE CURRENT SESSION/i.test(errorText(error)); }
 
 // Semua state di bawah ini milik SATU akun — di-scope per pemanggilan
 // runBuyerSession supaya banyak akun bisa hidup berdampingan dalam satu proses.
