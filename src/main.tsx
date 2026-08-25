@@ -105,15 +105,15 @@ function PackageStore({ onBack }: { onBack: () => void }) {
       if (telegramApp?.openLink) telegramApp.openLink(url); else window.open(url, "_blank");
     } catch (e) { setError((e as Error).message); } finally { setBusyId(""); }
   };
-  const groups = (["ADMIN_BROADCAST", "USERBOT_PROMO"] as const).map((service) => ({ service, items: (items ?? []).filter((item) => item.service === service) }));
+  const groups = (["ADMIN_BROADCAST", "USERBOT_PROMO"] as const).map((service) => ({ service, items: [...(items ?? [])].filter((item) => item.service === service).sort((a, b) => a.durationDays - b.durationDays || a.price - b.price) }));
   return <main className="shell welcome checkout">
     <button className="back-link" onClick={onBack}>← Kembali</button>
     <header><div className="eyebrow">TOKO PAKET</div><h1>Pilih paket langganan.</h1><p>Bayar lewat QRIS atau Virtual Account, layanan aktif otomatis setelah pembayaran terkonfirmasi.</p></header>
     {error && <div className="notice error">{error}</div>}{notice && <div className="notice">{notice}</div>}
     {!items ? <div className="choice-panel">Memuat paket…</div> : !items.length ? <div className="choice-panel">Belum ada paket yang dibuka. Hubungi admin @Kertaaji.</div> : <div className="choice-stack">
-      {groups.filter((group) => group.items.length).map((group) => <section key={group.service} className="choice-panel">
-        <div className="choice-heading"><span>{productLabel(group.service).toUpperCase()}</span><b>{group.service === "ADMIN_BROADCAST" ? "Auto Sebar · Akun Admin" : "Auto Sebar + Auto Komen MF · Akun Lo"}</b></div>
-        <div className="option-grid">{group.items.map((item) => <button key={item.packageId} disabled={Boolean(busyId)} onClick={() => void checkout(item)}><b>{item.name}</b><span>{item.durationDays} hari · {item.maxGroups} LPM</span><b>{rupiah(item.price)}</b><span>{busyId === item.packageId ? "Membuka pembayaran…" : "Bayar sekarang"}</span></button>)}</div>
+      {groups.filter((group) => group.items.length).map((group) => <section key={group.service} className="catalog-group">
+        <div className="catalog-heading"><span className={`icon-tile ${group.service === "ADMIN_BROADCAST" ? "broadcast-icon" : "comment-icon"}`}><ProductIcon name={group.service === "ADMIN_BROADCAST" ? "broadcast" : "comment"} /></span><div><small>{productLabel(group.service).toUpperCase()}</small><h2>{group.service === "ADMIN_BROADCAST" ? "Auto Sebar · Akun Admin" : "Auto Sebar + Auto Komen MF · Akun Lo"}</h2></div></div>
+        <div className="catalog-list">{group.items.map((item) => <article key={item.packageId} className="catalog-item"><div><b>{item.name}</b><span>{item.durationDays} hari · {item.maxGroups} grup LPM</span></div><strong>{rupiah(item.price)}</strong><button className="catalog-buy" disabled={Boolean(busyId)} onClick={() => void checkout(item)}>{busyId === item.packageId ? "Membuka pembayaran…" : "Bayar sekarang"}</button></article>)}</div>
       </section>)}
       <section className="choice-panel subscription-closed"><div><b>Sudah bayar tapi belum aktif?</b><span>Tunggu sebentar lalu buka ulang aplikasi. Kalau masih belum aktif, hubungi admin dengan bukti bayar.</span></div><a href="https://t.me/Kertaaji" target="_blank" rel="noreferrer">@Kertaaji</a></section>
     </div>}
