@@ -185,9 +185,29 @@ function startUserbotRunner() {
   // legacy per-akun, ia sengaja TIDAK detached: saat Railway menghentikan server,
   // shutdown di bawah mengirim SIGTERM ke host ini juga. Dengan begitu tidak ada
   // koneksi Telegram yatim yang masih memakai session setelah deploy berikutnya.
-  const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/userbot-runner.ts")], { cwd: join(root, ".."), env: process.env, stdio: ["ignore", "ignore", "pipe"], detached: false });
+  const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/userbot-runner.ts")], { cwd: join(root, ".."), env: process.env, stdio: ["ignore", "pipe", "pipe"], detached: false });
   let stderr = "";
+  let stdoutTail = "";
   runner.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-1_200); });
+  // Host userbot melaporkan siklus hidup tiap akun sebagai baris JSON di stdout
+  // (userbot-connected/disconnected/exited). Diteruskan ke logger server supaya
+  // aktivitas Auto Komen MF & Jasa Sebar sampai level konek akun terbaca rapi
+  // di log Railway, tanpa harus membuka log proses child satu-satu.
+  runner.stdout?.on("data", (chunk: Buffer) => {
+    stdoutTail = (stdoutTail + chunk.toString()).slice(-4_000);
+    const lines = stdoutTail.split("\n");
+    stdoutTail = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const message = JSON.parse(line) as { event?: string; buyerId?: string; error?: string };
+        if (message.event === "userbot-connected") app.log.info({ buyerId: message.buyerId ?? null }, "🟢 Akun userbot tersambung");
+        else if (message.event === "userbot-disconnected") app.log.info({ buyerId: message.buyerId ?? null }, "🛑 Akun userbot terputus");
+        else if (message.event === "userbot-exited") app.log.warn({ buyerId: message.buyerId ?? null, error: message.error ?? null }, "Sesi akun userbot berhenti; dicoba lagi setelah jeda");
+        else app.log.info({ raw: line.slice(0, 220) }, "Pesan host userbot");
+      } catch { app.log.warn({ raw: line.slice(0, 220) }, "Baris tak terbaca dari host userbot"); }
+    }
+  });
   userbotRunner = runner;
   runner.on("error", (error) => app.log.error({ err: error }, "Could not start consolidated userbot runner"));
   runner.on("exit", (code, signal) => {
@@ -879,10 +899,13 @@ app.post<{ Body: { buyerId?: string; status?: UserbotAccountStatus; note?: strin
   const note = String(req.body?.note ?? "").replace(/[_\s]+/g, " ").trim().slice(0, 160);
   let removeSession = false;
   if (status === "CONNECTED") {
+    const changed = buyer.userbotAccountStatus !== "CONNECTED";
     buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue;
+    if (changed) app.log.info({ buyerId }, "🟢 Akun userbot tersambung (laporan runner)");
   } else {
     const changed = buyer.userbotAccountStatus !== "RECONNECT_REQUIRED";
     buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "RECONNECT_REQUIRED"; buyer.userbotAccountIssue = note || "Sesi akun sudah tidak aktif."; buyer.commentActive = false; buyer.userBroadcastActive = false;
+    if (changed) app.log.warn({ buyerId, note }, "💀 Sesi akun userbot mati permanen; menunggu dihubungkan ulang oleh buyer");
     const broadcast = broadcastFor(store, buyer.id, "BUYER");
     if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; }
     for (const job of store.commentJobs) if (job.buyerId === buyer.id && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
@@ -1338,8 +1361,19 @@ if (token) {
   void bot.start({ onStart: (info) => { botPollingStatus = "ready"; botUsername = info.username ?? botUsername; app.log.info({ username: info.username }, "Bot Telegram siap menerima pesan"); if (miniAppUrl) void bot?.api.setChatMenuButton({ menu_button: { type: "web_app", text: "Buka layanan", web_app: { url: miniAppUrl } } }).catch((error) => app.log.error(error, "Menu Mini App belum tersambung")); } }).catch((error) => { botPollingStatus = `error: ${telegramReason(error)}`; app.log.error(error, "Bot Telegram gagal menerima pesan"); });
 }
 
-const runnerReconcileInterval = setInterval(() => { reconcileRunnersSafely(); }, 30_000);
-runnerReconcileInterval.unref();
+// Reconcile berkala dengan pola self-scheduling ala NEXO: putaran berikutnya
+// hanya dijadwalkan SETELAH putaran sebelumnya bener-bener selesai. Pola
+// setInterval bisa menumpuk pemicu saat satu putaran lambat (Supabase ngadat),
+// sedangkan di sini maksimal ada satu eksekusi jalan + mutex internal
+// reconcileRunnersSafely yang mengantre satu permintaan lanjutan.
+let reconcileLoopStopped = false;
+const scheduleReconcileTick = () => {
+  const timer = setTimeout(() => {
+    void Promise.resolve(shuttingDown ? undefined : reconcileRunnersSafely()).catch(() => undefined).finally(() => { if (!reconcileLoopStopped) scheduleReconcileTick(); });
+  }, 30_000);
+  timer.unref();
+};
+scheduleReconcileTick();
 // Jejak memori tiap 60 detik: kalau kontainer OOM lagi, tren naiknya keliatan
 // di log Railway sebelum proses mati — nggak perlu nebak-nebak lagi.
 const memoryLogInterval = setInterval(() => {
@@ -1350,7 +1384,7 @@ memoryLogInterval.unref();
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
-  clearInterval(runnerReconcileInterval); if (runnerReconcileTimer) clearTimeout(runnerReconcileTimer);
+  reconcileLoopStopped = true; if (runnerReconcileTimer) clearTimeout(runnerReconcileTimer);
   for (const workerId of [...workerRunners.keys()]) stopWorkerRunner(workerId);
   stopUserbotRunner();
   for (const login of pendingWorkerLogins.values()) await login.client.disconnect().catch(() => undefined);
