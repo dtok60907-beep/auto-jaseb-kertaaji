@@ -15,9 +15,21 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { Api, TelegramClient } from "teleproto";
+import { Logger } from "teleproto/extensions/Logger.js";
 import { StringSession } from "teleproto/sessions/index.js";
 import { NewMessage } from "teleproto/events/index.js";
 import { readEncryptedSessions } from "../src/database.js";
+
+// Logger GramJS default mencetak INFO ("Sleeping for 3s", dsb.) ke stdout dengan
+// kode warna — menenggelamkan event JSON siklus hidup akun yang dibaca server.
+// Karena itu semua client dipasok logger kustom: hanya WARN/ERROR yang diteruskan
+// (via handler, bukan print langsung), INFO GramJS dibuang di sumbernya.
+class QuietGramJsLogger extends Logger {
+  constructor() { super("warn" as never); }
+  canSend(level: string) { return level === "error" || level === "warn"; }
+  log() { /* tidak pernah cetak langsung; lewat handler */ }
+}
+const quietLogger = new QuietGramJsLogger();
 
 type Target = { base: string; discussion?: string; status: string; baseId?: string; discussionId?: string; baseInput?: any; discussionInput?: any };
 type CommentJob = { id: string; deliveryToken: string; base: string; messageId: string; wording: string; link: string };
@@ -60,7 +72,7 @@ function sessionInvalid(error: unknown) { return /AUTH_KEY_UNREGISTERED|AUTH_KEY
 // Semua state di bawah ini milik SATU akun — di-scope per pemanggilan
 // runBuyerSession supaya banyak akun bisa hidup berdampingan dalam satu proses.
 export async function runBuyerSession(buyerId: string, isStillWanted: () => boolean = () => true) {
-  const client = new TelegramClient(new StringSession(await loadSession(buyerId)), apiId, apiHash, { connectionRetries: 5 });
+  const client = new TelegramClient(new StringSession(await loadSession(buyerId)), apiId, apiHash, { connectionRetries: 5, baseLogger: quietLogger });
   let targets: Target[] = [];
   let userLpmTargets: string[] = [];
   let reconnectRequired = false;
