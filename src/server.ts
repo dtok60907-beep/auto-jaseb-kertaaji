@@ -42,7 +42,7 @@ type Withdrawal = { id: string; telegramId: string; grossAmount: number; fee: nu
 type Store = { buyers: Buyer[]; workers: Worker[]; broadcasts: Broadcast[]; lpmTargets: LpmTarget[]; commentConfigs: CommentConfig[]; commentTargets: CommentTarget[]; activities: Activity[]; approvalCandidates: Candidate[]; commentJobs: CommentJob[]; dedupe: { buyerId: string; base: string; messageId: string; at: string }[]; payments: Payment[]; withdrawals: Withdrawal[]; payoutProfiles: PayoutProfile[]; subscriptions: Subscription[]; packages: Package[] };
 type CommerceOrder = { id: string; orderId: string; buyer: string; plan: PaymentPlan; durationDays: number; maxGroups: number; amount: number; status: Payment["status"]; createdAt: string; paidAt?: string };
 type CommerceWithdrawal = Pick<Withdrawal, "id" | "grossAmount" | "fee" | "netAmount" | "walletType" | "walletNumber" | "walletOwner" | "status" | "createdAt" | "paidAt">;
-type Commerce = { today: number; week: number; month: number; paidCount: number; pendingBalance: number; availableBalance: number; requestedBalance: number; canRequestWithdrawal: boolean; orders: CommerceOrder[]; withdrawals: CommerceWithdrawal[] };
+type Commerce = { today: number; week: number; month: number; paidCount: number; pendingBalance: number; availableBalance: number; requestedBalance: number; canRequestWithdrawal: boolean; orders: CommerceOrder[]; withdrawals: CommerceWithdrawal[]; netProfit: number };
 
 const root = dirname(fileURLToPath(import.meta.url));
 const dataFile = join(root, "../data/store.json");
@@ -416,7 +416,11 @@ function commerceFor(store: Store): Commerce {
   const availableBalance = total(unclaimed.filter((item) => pakasirAvailableAt(item.paidAt!).getTime() <= current.getTime()));
   const requestedBalance = store.withdrawals.filter((item) => item.status === "REQUESTED").reduce((sum, item) => sum + item.grossAmount, 0);
   const withdrawals = [...store.withdrawals].sort((left, right) => Date.parse(right.paidAt ?? right.createdAt) - Date.parse(left.paidAt ?? left.createdAt)).slice(0, 20).map(({ id, grossAmount, fee, netAmount, walletType, walletNumber, walletOwner, status, createdAt, paidAt }) => ({ id, grossAmount, fee, netAmount, walletType, walletNumber, walletOwner, status, createdAt, paidAt }));
-  return { today: total(paidOn((key) => key === today)), week: total(paidOn((key) => key >= weekStart && key <= today)), month: total(paidOn((key) => key.startsWith(month))), paidCount: paid.length, pendingBalance, availableBalance, requestedBalance, canRequestWithdrawal: withdrawWindowOpen(current) && availableBalance >= 30_000, orders, withdrawals };
+  // Keuntungan bersih = pendapatan lunas dikurangi estimasi fee gateway Pakasir
+  // dan fee penarikan. Ditampilkan agar admin melihat angka yang benar-benar
+  // cair di tangan, bukan omzet kotor.
+  const netProfit = total(paid) - paid.reduce((sum, item) => sum + pakasirGatewayFee(item.amount), 0) - store.withdrawals.reduce((sum, item) => sum + item.fee, 0);
+  return { today: total(paidOn((key) => key === today)), week: total(paidOn((key) => key >= weekStart && key <= today)), month: total(paidOn((key) => key.startsWith(month))), paidCount: paid.length, pendingBalance, availableBalance, requestedBalance, canRequestWithdrawal: withdrawWindowOpen(current) && availableBalance >= 30_000, orders, withdrawals, netProfit };
 }
 function productLabel(product: "ADMIN_BROADCAST" | "USERBOT_PROMO") { return product === "ADMIN_BROADCAST" ? "Auto Sebar" : "Userbot Promosi"; }
 function activeSubscription(store: Store, buyerId: string, plan: Plan, timestamp = Date.now()) { return store.subscriptions.find((item) => item.buyerId === buyerId && item.plan === plan && item.status === "ACTIVE" && Date.parse(item.endsAt) > timestamp); }
@@ -1078,6 +1082,14 @@ app.post<{ Params: { id: string; product: string } }>("/api/admin/buyers/:id/sub
 });
 
 const withdrawalFee = 5_000;
+// Fee gateway Pakasir (sumber: pakasir.com/p/pricing, ditanggung merchant):
+// QRIS 0.7% + Rp310 (di atas Rp105.000 menjadi 1%), Virtual Account flat Rp3.500.
+// Estimasi ini dipakai untuk menampilkan KEUNTUNGAN BERSIH yang benar-benar
+// bisa ditarik — bukan perhitungan penarikan itu sendiri.
+function pakasirGatewayFee(amount: number) {
+  const safeAmount = Math.max(0, Math.floor(Number(amount) || 0));
+  return Math.ceil(safeAmount * (safeAmount > 105_000 ? 0.01 : 0.007)) + 310;
+}
 const walletTypes = ["DANA", "GoPay", "OVO", "ShopeePay", "LinkAja"] as const;
 function payoutDetails(input: { walletType?: string; walletNumber?: string; walletOwner?: string }): Pick<PayoutProfile, "walletType" | "walletNumber" | "walletOwner"> {
   const walletType = String(input.walletType ?? "") as WalletType;
