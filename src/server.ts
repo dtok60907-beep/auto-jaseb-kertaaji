@@ -1,6 +1,8 @@
 import "dotenv/config";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { createCipheriv, createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import Fastify from "fastify";
@@ -47,6 +49,14 @@ const dataFile = join(root, "../data/store.json");
 const sessionsFile = join(root, "../data/worker-sessions.json");
 const commentSessionsFile = join(root, "../data/comment-sessions.json");
 const app = Fastify({ logger: true });
+// GramJS kadang melempar "TIMEOUT" dari update-loop internal (getDifference) —
+// itu benign dan auto-retry. Tanpa tameng ini log produksi penuh noise
+// unhandledRejection padahal sistem sehat.
+process.on("unhandledRejection", (reason) => {
+  const message = String((reason as { message?: string })?.message ?? reason);
+  if (/TIMEOUT|FLOOD_WAIT_/i.test(message)) return;
+  app.log.warn({ err: message.slice(0, 220) }, "Unhandled rejection ditangkap");
+});
 if (process.env.NODE_ENV === "production") await app.register(fastifyStatic, { root: join(root, "../dist") });
 let storeLockTail: Promise<void> = Promise.resolve();
 const requestUnlocks = new WeakMap<object, () => void>();
@@ -85,9 +95,21 @@ type PendingCommentLogin = { buyerId: string; phone: string; phoneCodeHash: stri
 const pendingWorkerLogins = new Map<string, PendingWorkerLogin>();
 const pendingCommentLogins = new Map<string, PendingCommentLogin>();
 const workerRunners = new Map<string, ChildProcess>();
-const commentRunners = new Map<string, ChildProcess>();
+let userbotRunner: ChildProcess | undefined;
+const userbotRosterFile = join(root, "../data/userbot-roster.json");
+let userbotRosterText = "";
+let userbotRosterSize = 0;
 let runnerReconcileTimer: ReturnType<typeof setTimeout> | undefined;
 let shuttingDown = false;
+let runnerReconcileInFlight: Promise<void> | undefined;
+let runnerReconcileRequested = false;
+// Backoff ala engine NEXO: runner yang baru saja mati tidak boleh dinyalakan
+// lagi beberapa detik kemudian — selain sia-sia (bakar CPU), koneksi ulang yang
+// keburu-buru bisa memicu AUTH_KEY_DUPLICATED berantai. Kunci = "userbot-host"
+// atau "worker:<id>", nilai = waktu paling cepat boleh nyala lagi.
+const runnerRestartNotBefore = new Map<string, number>();
+const RUNNER_CRASH_COOLDOWN_MS = 90_000;
+const RUNNER_DUPLICATED_COOLDOWN_MS = 5 * 60_000;
 
 function workerSessionKey() { const secret = process.env.WORKER_SESSION_KEY ?? ""; if (secret.length < 24) throw new Error("Konfigurasi session worker belum siap."); return createHash("sha256").update(secret).digest(); }
 function encryptWorkerSession(value: string) { const iv = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", workerSessionKey(), iv); const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]); return [iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), encrypted.toString("base64url")].join("."); }
@@ -99,21 +121,92 @@ async function saveCommentSession(buyerId: string, session: string) { await save
 async function removeCommentSession(buyerId: string) { await removeEncryptedSession("comment", commentSessionsFile, buyerId); }
 function telegramCredentials() { const apiId = Number(process.env.TELEGRAM_API_ID); const apiHash = process.env.TELEGRAM_API_HASH ?? ""; if (!Number.isInteger(apiId) || !apiHash) throw new Error("API Telegram belum siap."); return { apiId, apiHash }; }
 function telegramReason(error: unknown) { return String((error as { errorMessage?: string; message?: string })?.errorMessage ?? (error as Error)?.message ?? "Tidak bisa menghubungkan akun.").replace(/_/g, " "); }
-function scheduleRunnerReconcile(delay = 5_000) { if (shuttingDown || runnerReconcileTimer) return; runnerReconcileTimer = setTimeout(() => { runnerReconcileTimer = undefined; reconcileRunnersSafely(); }, delay); runnerReconcileTimer.unref(); }
+function scheduleRunnerReconcile(delay = 5_000) { if (shuttingDown || runnerReconcileTimer) return; runnerReconcileTimer = setTimeout(() => { runnerReconcileTimer = undefined; void reconcileRunnersSafely(); }, delay); runnerReconcileTimer.unref(); }
+// Runner di-spawn detached agar tidak ikut mati saat npm/tsx restart, tapi itu
+// menyisakan proses yatim kalau server mati keras (OOM kill). Pidfile dipakai
+// untuk membunuh sisa runner lama SEBELUM set baru dispawn — tanpa ini, tiap
+// restart menumpuk proses GramJS dan memori kontainer makin cepat habis.
+const runnerPidFile = join(root, "../data/comment-runner.pids");
+const bootHostname = hostname();
+type RunnerPidEntry = { pid: number; host: string; workerId?: string; userbotHost?: true };
+function writeRunnerPids(entries: RunnerPidEntry[]) {
+  try { writeFileSync(runnerPidFile, JSON.stringify(entries)); } catch (error) { app.log.warn({ err: error }, "Gagal menulis pidfile runner."); }
+}
+function collectRunnerPids(): RunnerPidEntry[] {
+  const entries: RunnerPidEntry[] = [];
+  if (userbotRunner?.exitCode === null && userbotRunner.pid) entries.push({ pid: userbotRunner.pid, host: bootHostname, userbotHost: true });
+  for (const [workerId, runner] of workerRunners) if (runner.exitCode === null && runner.pid) entries.push({ pid: runner.pid!, host: bootHostname, workerId });
+  return entries;
+}
+function killStaleRunner(pid: number) {
+  try { process.kill(-pid, "SIGKILL"); } catch { try { process.kill(pid, "SIGKILL"); } catch {} }
+}
+function reapOrphanedRunners() {
+  let stale: RunnerPidEntry[] = [];
+  try { stale = JSON.parse(readFileSync(runnerPidFile, "utf8")) as RunnerPidEntry[]; } catch { return; }
+  const alive = new Set(collectRunnerPids().map((entry) => entry.pid));
+  let orphans = 0;
+  for (const entry of stale) {
+    // Pid dari kontainer/deploy lain tidak bisa dipercaya di namespace PID baru —
+    // cukup buang catatannya, jangan pernah kirim sinyal ke pid yang bukan milik kita.
+    if (!Number.isInteger(entry.pid) || entry.pid <= 1 || entry.host !== bootHostname || alive.has(entry.pid)) continue;
+    killStaleRunner(entry.pid);
+    app.log.warn({ pid: entry.pid, workerId: entry.workerId ?? null, userbotHost: Boolean(entry.userbotHost) }, "Runner yatim dari boot sebelumnya dimatikan.");
+    orphans += 1;
+  }
+  if (orphans > 0) app.log.warn({ total: orphans }, "Pembersihan runner yatim selesai.");
+}
+function appendRunnerPid(entry: RunnerPidEntry) {
+  let entries: RunnerPidEntry[] = [];
+  try { entries = JSON.parse(readFileSync(runnerPidFile, "utf8")) as RunnerPidEntry[]; } catch {}
+  writeRunnerPids([...entries.filter((item) => item.pid !== entry.pid && item.pid > 1), entry]);
+}
+function removeRunnerPid(pid: number | undefined) {
+  if (!pid) return;
+  try { const entries = JSON.parse(readFileSync(runnerPidFile, "utf8")) as RunnerPidEntry[]; writeRunnerPids(entries.filter((item) => item.pid !== pid)); } catch {}
+}
+// Spawn pelan-pelan satu-per-satu: lima koneksi GramJS serentak di awal bikin
+// pemakaian memori melonjak sekaligus dan memicu OOM di kontainer kecil.
+function scheduleStaggeredStarts(starts: (() => void)[], gapMs = 4_000) { starts.forEach((start, index) => { const timer = setTimeout(() => { if (!shuttingDown) start(); }, index * gapMs); timer.unref(); }); }
 function terminateRunner(runner: ChildProcess | undefined) { if (!runner || runner.exitCode !== null) return; try { if (runner.pid) process.kill(-runner.pid, "SIGTERM"); else runner.kill(); } catch { runner.kill(); } }
-function startWorkerRunner(workerId: string) { if (shuttingDown || workerRunners.get(workerId)?.exitCode === null) return; const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/lpm-runner.ts"), workerId], { cwd: join(root, ".."), env: process.env, stdio: "ignore", detached: true }); workerRunners.set(workerId, runner); runner.on("exit", () => { workerRunners.delete(workerId); scheduleRunnerReconcile(); }); runner.unref(); }
+function startWorkerRunner(workerId: string) { if (shuttingDown || workerRunners.get(workerId)?.exitCode === null) return; if (Date.now() < (runnerRestartNotBefore.get("worker:" + workerId) ?? 0)) return; const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/lpm-runner.ts"), workerId], { cwd: join(root, ".."), env: process.env, stdio: "ignore", detached: true }); workerRunners.set(workerId, runner); appendRunnerPid({ pid: runner.pid!, host: bootHostname, workerId }); runner.on("exit", () => { removeRunnerPid(runner.pid); workerRunners.delete(workerId); scheduleRunnerReconcile(); }); runner.unref(); }
 function stopWorkerRunner(workerId: string) { terminateRunner(workerRunners.get(workerId)); workerRunners.delete(workerId); }
-function startCommentRunner(buyerId: string) {
-  if (shuttingDown || commentRunners.get(buyerId)?.exitCode === null) return;
-  const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/comment-runner.ts"), buyerId], { cwd: join(root, ".."), env: process.env, stdio: ["ignore", "ignore", "pipe"], detached: true });
+function writeUserbotRoster(buyerIds: string[]) {
+  const text = JSON.stringify(buyerIds.sort());
+  userbotRosterSize = buyerIds.length;
+  if (text === userbotRosterText) return;
+  writeFileSync(userbotRosterFile, text);
+  userbotRosterText = text;
+}
+function startUserbotRunner() {
+  if (shuttingDown || userbotRosterSize === 0 || userbotRunner?.exitCode === null) return;
+  if (Date.now() < (runnerRestartNotBefore.get("userbot-host") ?? 0)) return;
+  // Host userbot adalah bagian dari lifecycle server ini. Berbeda dengan runner
+  // legacy per-akun, ia sengaja TIDAK detached: saat Railway menghentikan server,
+  // shutdown di bawah mengirim SIGTERM ke host ini juga. Dengan begitu tidak ada
+  // koneksi Telegram yatim yang masih memakai session setelah deploy berikutnya.
+  const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/userbot-runner.ts")], { cwd: join(root, ".."), env: process.env, stdio: ["ignore", "ignore", "pipe"], detached: false });
   let stderr = "";
   runner.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-1_200); });
-  commentRunners.set(buyerId, runner);
-  runner.on("error", (error) => app.log.error({ err: error, buyerId }, "Could not start userbot runner"));
-  runner.on("exit", (code, signal) => { commentRunners.delete(buyerId); if (!shuttingDown && code && code !== 0) app.log.warn({ buyerId, code, signal, stderr: stderr.trim().slice(-500) }, "Userbot runner stopped; reconciliation will decide whether to restart it"); scheduleRunnerReconcile(); });
+  userbotRunner = runner;
+  runner.on("error", (error) => app.log.error({ err: error }, "Could not start consolidated userbot runner"));
+  runner.on("exit", (code, signal) => {
+    if (userbotRunner === runner) userbotRunner = undefined;
+    const failed = Boolean(code && code !== 0);
+    if (!shuttingDown && failed) {
+      const duplicated = /AUTH_KEY_DUPLICATED/i.test(stderr);
+      const cooldown = duplicated ? RUNNER_DUPLICATED_COOLDOWN_MS : RUNNER_CRASH_COOLDOWN_MS;
+      runnerRestartNotBefore.set("userbot-host", Date.now() + cooldown);
+      scheduleRunnerReconcile(cooldown + 5_000);
+      app.log.warn({ code, signal, backoffMs: cooldown, stderr: stderr.trim().slice(-400) }, "Runner userbot gabungan berhenti; dinyalakan ulang setelah backoff");
+    } else if (!shuttingDown) {
+      app.log.info({ code, signal }, "Runner userbot gabungan berhenti dengan normal; rekonsiliasi akan memutuskan");
+    }
+    scheduleRunnerReconcile();
+  });
   runner.unref();
 }
-function stopCommentRunner(buyerId: string) { terminateRunner(commentRunners.get(buyerId)); commentRunners.delete(buyerId); }
+function stopUserbotRunner() { terminateRunner(userbotRunner); userbotRunner = undefined; }
 
 const defaultPackages = (): Package[] => [];
 const selfServiceSubscriptionsEnabled = process.env.SELF_SERVICE_SUBSCRIPTIONS === "true";
@@ -373,30 +466,54 @@ async function reconcileRunners() {
   if (shuttingDown) return;
   await withStoreLock(async () => {
     const store = await load(); cleanup(store); await save(store);
+    const delayedStarts: (() => void)[] = [];
     const workerSessions = await readWorkerSessions();
     for (const workerId of Object.keys(workerSessions)) {
       const worker = store.workers.find((item) => item.id === workerId);
-      if (worker && worker.status !== "DISABLED") startWorkerRunner(workerId);
+      // Worker tanpa pemilik (AVAILABLE) tidak dispawn: satu proses GramJS
+      // nganggur makan ±100MB RAM terus-menerus padahal tidak mengerjakan apa pun.
+      // Session-nya tetap disimpan, jadi begitu di-assign ke buyer reconcile
+      // otomatis menyalakan runner-nya.
+      if (worker && worker.status !== "DISABLED") { if (worker.buyerId) delayedStarts.push(() => startWorkerRunner(workerId)); else stopWorkerRunner(workerId); }
       else { stopWorkerRunner(workerId); await removeWorkerSession(workerId); }
     }
     const commentSessions = await readCommentSessions();
+    const activeUserbotBuyers: string[] = [];
     for (const buyerId of Object.keys(commentSessions)) {
       const buyer = store.buyers.find((item) => item.id === buyerId);
       // Satu runner buyer mengelola dua modul Userbot Promosi. Jangan spawn runner
       // kedua untuk Jaseb akun buyer karena dua koneksi dengan session yang sama bisa
       // membuat Telegram menolak auth key atau mengirim dobel.
       const allowed = Boolean(buyer && retainUserbotSession(hasPlanAccess(store, buyer, "COMMENT"), hasPlanAccess(store, buyer, "USERBOT_BROADCAST")));
-      if (buyer && buyer.commentAccountConnected && allowed) startCommentRunner(buyerId);
-      else { stopCommentRunner(buyerId); await removeCommentSession(buyerId); if (buyer) buyer.commentAccountConnected = false; }
+      if (buyer && buyer.commentAccountConnected && allowed) activeUserbotBuyers.push(buyerId);
+      else { await removeCommentSession(buyerId); if (buyer) buyer.commentAccountConnected = false; }
     }
+    writeUserbotRoster(activeUserbotBuyers);
+    if (activeUserbotBuyers.length) startUserbotRunner(); else stopUserbotRunner();
+    scheduleStaggeredStarts(delayedStarts);
     await save(store);
   });
 }
-function reconcileRunnersSafely() {
-  void reconcileRunners().catch((error) => {
-    app.log.warn({ err: error }, "Runner reconciliation skipped; will retry.");
+function reconcileRunnersSafely(): Promise<void> {
+  // Banyak pemicu bisa tiba hampir bersamaan (login, masa aktif habis, exit
+  // runner, dan pemeriksaan berkala). Satu rekonsiliasi pada satu waktu cukup;
+  // pemicu tambahan meminta satu putaran lagi setelahnya, tanpa antrean yang
+  // terus membesar saat Supabase sedang lambat.
+  if (runnerReconcileInFlight) {
+    runnerReconcileRequested = true;
+    return runnerReconcileInFlight;
+  }
+  runnerReconcileInFlight = reconcileRunners().catch((error) => {
+    app.log.warn({ err: error }, "Runner reconciliation gagal; akan dicoba lagi.");
     scheduleRunnerReconcile(15_000);
+  }).finally(() => {
+    runnerReconcileInFlight = undefined;
+    if (runnerReconcileRequested && !shuttingDown) {
+      runnerReconcileRequested = false;
+      scheduleRunnerReconcile(0);
+    }
   });
+  return runnerReconcileInFlight;
 }
 
 app.get("/api/buyer/dashboard", async (req, reply) => {
@@ -789,7 +906,7 @@ app.post<{ Body: { buyerId?: string; workerId?: string; chat?: string; type?: "M
 });
 
 async function clearPendingCommentLogin(buyerId: string) { const login = pendingCommentLogins.get(buyerId); pendingCommentLogins.delete(buyerId); if (login) await login.client.disconnect().catch(() => undefined); }
-async function finishCommentLogin(login: PendingCommentLogin, buyer: Buyer, store: Store) { const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan."); await saveCommentSession(buyer.id, session); buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue; buyer.updatedAt = now(); await save(store); pendingCommentLogins.delete(buyer.id); await login.client.disconnect(); startCommentRunner(buyer.id); }
+async function finishCommentLogin(login: PendingCommentLogin, buyer: Buyer, store: Store) { const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan."); runnerRestartNotBefore.delete("userbot-host"); await saveCommentSession(buyer.id, session); buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue; buyer.updatedAt = now(); await save(store); pendingCommentLogins.delete(buyer.id); await login.client.disconnect(); void reconcileRunnersSafely(); }
 
 app.post<{ Body: { phone?: string } }>("/api/buyer/comment-account/send-code", async (req, reply) => {
   const store = await load(); cleanup(store); const buyer = buyerForRequest(store, req);
@@ -1028,7 +1145,7 @@ async function finishWorkerLogin(login: PendingWorkerLogin, worker: Worker, stor
   if (store.workers.some((item) => item.id !== worker.id && item.username.toLowerCase() === username.toLowerCase())) throw new Error(`@${username} sudah terdaftar sebagai worker.`);
   worker.username = username; await save(store);
   const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan.");
-  await saveWorkerSession(worker.id, session); pendingWorkerLogins.delete(worker.id); await login.client.disconnect(); startWorkerRunner(worker.id);
+  await saveWorkerSession(worker.id, session); pendingWorkerLogins.delete(worker.id); await login.client.disconnect(); runnerRestartNotBefore.delete("worker:" + worker.id); startWorkerRunner(worker.id);
   return username;
 }
 async function clearPendingWorkerLogin(workerId: string) { const login = pendingWorkerLogins.get(workerId); pendingWorkerLogins.delete(workerId); if (login) await login.client.disconnect().catch(() => undefined); }
@@ -1214,17 +1331,28 @@ if (token) {
     if (!job || !buyer || buyer.telegramId !== String(ctx.from.id) || job.status !== "DONE" || !job.commentMessageId) { await ctx.answerCallbackQuery({ text: "Komentar ini sudah diproses atau tidak tersedia." }); await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => undefined); return; }
     job.status = "DELETE_PENDING"; const acknowledged = ctx.answerCallbackQuery({ text: "Komentar sedang dihapus." }); await save(store); await acknowledged; await ctx.editMessageReplyMarkup({ reply_markup: undefined }).catch(() => undefined);
   }); });
+  // Error boundary: tanpa ini, satu update bermasalah (misal penerima sudah
+  // block bot saat antrean update lama diputar ulang) me-reject bot.start()
+  // dan polling mati permanen walaupun server masih hidup.
+  bot.catch((error) => { app.log.warn({ err: error.error ?? error }, "Bot Telegram menemukan error pada satu update; polling tetap jalan."); });
   void bot.start({ onStart: (info) => { botPollingStatus = "ready"; botUsername = info.username ?? botUsername; app.log.info({ username: info.username }, "Bot Telegram siap menerima pesan"); if (miniAppUrl) void bot?.api.setChatMenuButton({ menu_button: { type: "web_app", text: "Buka layanan", web_app: { url: miniAppUrl } } }).catch((error) => app.log.error(error, "Menu Mini App belum tersambung")); } }).catch((error) => { botPollingStatus = `error: ${telegramReason(error)}`; app.log.error(error, "Bot Telegram gagal menerima pesan"); });
 }
 
 const runnerReconcileInterval = setInterval(() => { reconcileRunnersSafely(); }, 30_000);
 runnerReconcileInterval.unref();
+// Jejak memori tiap 60 detik: kalau kontainer OOM lagi, tren naiknya keliatan
+// di log Railway sebelum proses mati — nggak perlu nebak-nebak lagi.
+const memoryLogInterval = setInterval(() => {
+  const memory = process.memoryUsage();
+  app.log.info({ rssMb: Math.round(memory.rss / 1048576), heapUsedMb: Math.round(memory.heapUsed / 1048576), runners: (userbotRunner ? 1 : 0) + workerRunners.size, userbotAccounts: userbotRosterSize }, "Memory usage");
+}, 60_000);
+memoryLogInterval.unref();
 async function shutdown() {
   if (shuttingDown) return;
   shuttingDown = true;
   clearInterval(runnerReconcileInterval); if (runnerReconcileTimer) clearTimeout(runnerReconcileTimer);
   for (const workerId of [...workerRunners.keys()]) stopWorkerRunner(workerId);
-  for (const buyerId of [...commentRunners.keys()]) stopCommentRunner(buyerId);
+  stopUserbotRunner();
   for (const login of pendingWorkerLogins.values()) await login.client.disconnect().catch(() => undefined);
   for (const login of pendingCommentLogins.values()) await login.client.disconnect().catch(() => undefined);
   await bot?.stop().catch(() => undefined); await app.close().catch(() => undefined);
@@ -1232,4 +1360,5 @@ async function shutdown() {
 process.once("SIGTERM", () => { void shutdown().finally(() => process.exit(0)); });
 process.once("SIGINT", () => { void shutdown().finally(() => process.exit(0)); });
 await app.listen({ port: Number(process.env.PORT ?? 8787), host: "0.0.0.0" });
+reapOrphanedRunners();
 reconcileRunnersSafely();

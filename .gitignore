@@ -4,4 +4,6 @@ dist/
 data/store.local.json
 data/worker-sessions.json
 data/comment-sessions.json
+data/userbot-roster.json
+data/comment-runner.pids
 .DS_Store

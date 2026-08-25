@@ -57,22 +57,40 @@ async function writeLocal(file: string, value: unknown) {
 }
 
 /** Uses the checked-in local store until both Supabase runtime credentials exist. */
+
+// Efisiensi biaya: satu-satunya penulis store adalah proses server ini, jadi
+// teks store boleh dicache dan di-refresh dari Supabase maksimal sekali per
+// TTL (atau langsung setelah tulis sendiri). Ini memangkas ratusan ribu
+// GET 87KB per hari tanpa mengubah semantik apa pun bagi pemanggil — setiap
+// load() tetap menghasilkan objek baru hasil parse.
+const storeTextCache = new Map<string, { text: string; fetchedAt: number }>();
+const STORE_CACHE_TTL_MS = Number(process.env.STORE_CACHE_TTL_MS ?? 60_000);
+
 export async function loadPersistentStore<T>(localFile: string, fallback: T): Promise<T> {
   const config = supabase();
   if (!config) return readLocal(localFile, fallback);
+  const cached = storeTextCache.get(localFile);
+  if (cached && Date.now() - cached.fetchedAt < STORE_CACHE_TTL_MS) return JSON.parse(cached.text) as T;
   const response = await supabaseRequest(config, "app_state?id=eq.primary&select=state", { headers: restHeaders(config) }, "Tidak bisa membaca database Supabase");
   const rows = await response.json() as { state?: T }[];
-  return rows[0]?.state ?? fallback;
+  const state = rows[0]?.state;
+  if (state !== undefined) storeTextCache.set(localFile, { text: JSON.stringify(state), fetchedAt: Date.now() });
+  return state ?? fallback;
 }
 
 export async function savePersistentStore<T>(localFile: string, value: T) {
   const config = supabase();
   if (!config) return writeLocal(localFile, value);
+  const serialized = JSON.stringify(value);
+  // Tulis yang isinya identik tidak dikirim ke Supabase — reconcile berkala
+  // sebelumnya selalu menulis ulang walau tak ada perubahan.
+  if (storeTextCache.get(localFile)?.text === serialized) return;
   await supabaseRequest(config, "app_state?id=eq.primary", {
     method: "PATCH",
     headers: restHeaders(config, { prefer: "return=minimal" }),
     body: JSON.stringify({ state: value, updated_at: new Date().toISOString() }),
   }, "Tidak bisa menyimpan database Supabase");
+  storeTextCache.set(localFile, { text: serialized, fetchedAt: Date.now() });
 }
 
 export async function readEncryptedSessions(kind: SessionKind, localFile: string) {
