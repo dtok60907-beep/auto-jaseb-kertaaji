@@ -551,9 +551,10 @@ app.get("/api/buyer/dashboard", async (req, reply) => {
     }
   }
   if (changed) await save(store);
-  if (!buyer) return { onboarding: true, buyer: null, worker: null, broadcast: null, userBroadcast: null, lpmTargets: [], userLpmTargets: [], commentTargets: [], comment: null, activity: [] };
+  if (!buyer) return { onboarding: true, buyer: null, subscriptionsOpen: selfServiceSubscriptionsEnabled, worker: null, broadcast: null, userBroadcast: null, lpmTargets: [], userLpmTargets: [], commentTargets: [], comment: null, activity: [] };
   return {
     buyer: buyerWithEffectiveAccess(store, buyer),
+    subscriptionsOpen: selfServiceSubscriptionsEnabled,
     entitlements: entitlementSummary(store, buyer),
     broadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),
     userBroadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),

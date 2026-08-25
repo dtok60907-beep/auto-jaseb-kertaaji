@@ -22,7 +22,7 @@ type Entitlement = { active: boolean; legacy: boolean; endsAt?: string; maxGroup
 type Entitlements = { adminBroadcast: Entitlement; userbotPromo: Entitlement };
 type AdminOverview = { buyers: Buyer[]; entitlements?: Record<string, Entitlements>; workers: Worker[]; workerSessions?: string[]; broadcasts: BroadcastConfig[]; lpmTargets: LpmTarget[]; comments: CommentConfig[]; packages: Package[]; commerce: Commerce };
 type BroadcastDraft = { mode: BroadcastMode; wording: string; forwardLink: string; showForwardSource: boolean; groups: string; intervalMinutes: string };
-type Dashboard = { onboarding?: boolean; buyer: Buyer | null; entitlements?: Entitlements; broadcastQuota?: number | null; userBroadcastQuota?: number | null; worker: Worker | null; broadcast: BroadcastConfig | null; userBroadcast: BroadcastConfig | null; lpmTargets: LpmTarget[]; userLpmTargets: LpmTarget[]; commentTargets: { id: string; base: string; discussion?: string; status: string }[]; comment: Omit<CommentConfig, "buyerId"> | null; activity: { kind: string; status: string; label: string; link?: string; at: string }[] };
+type Dashboard = { onboarding?: boolean; buyer: Buyer | null; subscriptionsOpen?: boolean; entitlements?: Entitlements; broadcastQuota?: number | null; userBroadcastQuota?: number | null; worker: Worker | null; broadcast: BroadcastConfig | null; userBroadcast: BroadcastConfig | null; lpmTargets: LpmTarget[]; userLpmTargets: LpmTarget[]; commentTargets: { id: string; base: string; discussion?: string; status: string }[]; comment: Omit<CommentConfig, "buyerId"> | null; activity: { kind: string; status: string; label: string; link?: string; at: string }[] };
 declare global { interface Window { Telegram?: { WebApp?: { initData: string; initDataUnsafe?: { start_param?: string }; ready: () => void; expand: () => void; openLink?: (url: string) => void } } } }
 const telegramApp = window.Telegram?.WebApp;
 telegramApp?.ready(); telegramApp?.expand();
@@ -65,10 +65,39 @@ function ListEditor({ value, onChange, placeholder, disabled }: { value: string;
 }
 function BroadcastContentFields({ value, onChange }: { value: Pick<BroadcastDraft, "mode" | "wording" | "forwardLink" | "showForwardSource">; onChange: (next: Partial<BroadcastDraft>) => void }) { return <div className="broadcast-content"><div className="broadcast-mode" role="group" aria-label="Jenis kiriman"><button className={value.mode === "TEXT" ? "chosen" : ""} type="button" onClick={() => onChange({ mode: "TEXT" })}>Tulis wording</button><button className={value.mode === "FORWARD" ? "chosen" : ""} type="button" onClick={() => onChange({ mode: "FORWARD" })}>Forward post</button></div>{value.mode === "TEXT" ? <label>Wording<textarea value={value.wording} onChange={(event) => onChange({ wording: event.target.value })} placeholder="Tulis wording promosi…" /></label> : <><label>Link bubble chat wording<small>Post wording ke channel publik lo, buka post-nya, salin tautan bubble chat, lalu tempel di sini.</small><input value={value.forwardLink} onChange={(event) => onChange({ forwardLink: event.target.value })} placeholder="https://t.me/namachannel/123" /></label><label className="forward-source"><input type="checkbox" checked={value.showForwardSource} onChange={(event) => onChange({ showForwardSource: event.target.checked })} /> Tampilkan sumber forward</label></>}</div>; }
 
-function SubscriptionClosed() {
+type PublicPackage = { packageId: string; service: "ADMIN_BROADCAST" | "USERBOT_PROMO"; name: string; price: number; durationDays: number; maxGroups: number };
+function SubscriptionClosed({ onOpenShop }: { onOpenShop: () => void }) {
   return <main className="shell welcome checkout">
     <header><div className="eyebrow">PAKET PROMOSI</div><h1>Langganan sementara ditutup.</h1><p>Aktivasi layanan saat ini dibantu langsung oleh admin.</p></header>
     <section className="choice-panel subscription-closed"><span className="icon-tile comment-icon"><ProductIcon name="comment" /></span><div><b>Butuh akses layanan?</b><span>Hubungi admin untuk pengaktifan Auto Sebar dan Auto Komen MF.</span></div><a href="https://t.me/Kertaaji" target="_blank" rel="noreferrer">@Kertaaji</a></section>
+  </main>;
+}
+
+function PackageStore({ onBack }: { onBack: () => void }) {
+  const [items, setItems] = useState<PublicPackage[] | null>(null); const [error, setError] = useState(""); const [notice, setNotice] = useState(""); const [busyId, setBusyId] = useState("");
+  const load = async () => { try { setItems(await api<PublicPackage[]>("/api/public/packages")); } catch (e) { setError((e as Error).message); } };
+  useEffect(() => { void load(); }, []);
+  const checkout = async (item: PublicPackage) => {
+    setBusyId(item.packageId); setError(""); setNotice("");
+    try {
+      const result = await api<{ paymentUrl: string }>("/api/public/checkout", { method: "POST", body: JSON.stringify({ packageId: item.packageId }) });
+      setNotice("Membuka halaman pembayaran…");
+      const url = result.paymentUrl;
+      if (telegramApp?.openLink) telegramApp.openLink(url); else window.open(url, "_blank");
+    } catch (e) { setError((e as Error).message); } finally { setBusyId(""); }
+  };
+  const groups = (["ADMIN_BROADCAST", "USERBOT_PROMO"] as const).map((service) => ({ service, items: (items ?? []).filter((item) => item.service === service) }));
+  return <main className="shell welcome checkout">
+    <button className="back-link" onClick={onBack}>← Kembali</button>
+    <header><div className="eyebrow">TOKO PAKET</div><h1>Pilih paket langganan.</h1><p>Bayar lewat QRIS atau Virtual Account, layanan aktif otomatis setelah pembayaran terkonfirmasi.</p></header>
+    {error && <div className="notice error">{error}</div>}{notice && <div className="notice">{notice}</div>}
+    {!items ? <div className="choice-panel">Memuat paket…</div> : !items.length ? <div className="choice-panel">Belum ada paket yang dibuka. Hubungi admin @Kertaaji.</div> : <div className="choice-stack">
+      {groups.filter((group) => group.items.length).map((group) => <section key={group.service} className="choice-panel">
+        <div className="choice-heading"><span>{productLabel(group.service).toUpperCase()}</span><b>{group.service === "ADMIN_BROADCAST" ? "Auto Sebar · Akun Admin" : "Auto Sebar + Auto Komen MF · Akun Lo"}</b></div>
+        <div className="option-grid">{group.items.map((item) => <button key={item.packageId} disabled={Boolean(busyId)} onClick={() => void checkout(item)}><b>{item.name}</b><span>{item.durationDays} hari · {item.maxGroups} LPM</span><b>{rupiah(item.price)}</b><span>{busyId === item.packageId ? "Membuka pembayaran…" : "Bayar sekarang"}</span></button>)}</div>
+      </section>)}
+      <section className="choice-panel subscription-closed"><div><b>Sudah bayar tapi belum aktif?</b><span>Tunggu sebentar lalu buka ulang aplikasi. Kalau masih belum aktif, hubungi admin dengan bukti bayar.</span></div><a href="https://t.me/Kertaaji" target="_blank" rel="noreferrer">@Kertaaji</a></section>
+    </div>}
   </main>;
 }
 
@@ -80,8 +109,17 @@ function BuyerApp() {
   const sendCommentCode = async () => { setBusy("CONNECT"); setError(""); try { await api("/api/buyer/comment-account/send-code", { method: "POST", headers: buyerHeaders, body: JSON.stringify({ phone: commentPhone }) }); setCommentLoginStep("CODE"); } catch (e) { setError((e as Error).message); } finally { setBusy(""); } };
   const verifyCommentCode = async () => { setBusy("CONNECT"); setError(""); try { const result = await api<{ next: "PASSWORD" | "DONE" }>("/api/buyer/comment-account/verify-code", { method: "POST", headers: buyerHeaders, body: JSON.stringify({ code: commentCode }) }); if (result.next === "PASSWORD") setCommentLoginStep("PASSWORD"); else { setCommentLoginOpen(false); await load(); } } catch (e) { setError((e as Error).message); } finally { setBusy(""); } };
   const verifyCommentPassword = async () => { setBusy("CONNECT"); setError(""); try { await api("/api/buyer/comment-account/verify-password", { method: "POST", headers: buyerHeaders, body: JSON.stringify({ password: commentPassword }) }); setCommentLoginOpen(false); setCommentPassword(""); await load(); } catch (e) { setError((e as Error).message); } finally { setBusy(""); } };
+  const [shopOpen, setShopOpen] = useState(false);
   if (!data) return <main className="shell loading">{error ? <div className="notice error">{error}</div> : "Memuat layanan…"}</main>;
-  if (!data.buyer || (!data.buyer.planBroadcast && !data.buyer.planUserBroadcast && !data.buyer.planComment)) return <SubscriptionClosed />;
+  if (shopOpen) return <PackageStore onBack={() => { setShopOpen(false); void load(); }} />;
+  if (!data.buyer || (!data.buyer.planBroadcast && !data.buyer.planUserBroadcast && !data.buyer.planComment)) {
+    const shopAvailable = Boolean(data.subscriptionsOpen);
+    return <main className="shell welcome checkout">
+      <header><div className="eyebrow">PAKET PROMOSI</div><h1>{shopAvailable ? "Belum langganan." : "Langganan sementara ditutup."}</h1><p>{shopAvailable ? "Pilih paket, bayar, dan layanan aktif otomatis." : "Aktivasi layanan saat ini dibantu langsung oleh admin."}</p></header>
+      {shopAvailable && <button className="feature-choice comment-choice" onClick={() => setShopOpen(true)}><span className="icon-tile comment-icon"><ProductIcon name="comment" /></span><div><small>LANGGANAN</small><b>Beli paket langganan</b><span>Pilih Auto Sebar atau Userbot Promosi, bayar sendiri kapan saja.</span></div><i>→</i></button>}
+      <section className="choice-panel subscription-closed"><span className="icon-tile comment-icon"><ProductIcon name="comment" /></span><div><b>Butuh akses layanan?</b><span>Hubungi admin untuk pengaktifan Auto Sebar dan Auto Komen MF.</span></div><a href="https://t.me/Kertaaji" target="_blank" rel="noreferrer">@Kertaaji</a></section>
+    </main>;
+  }
   const { buyer, worker, broadcast, userBroadcast, comment } = data;
   const readyLpmCount = data.lpmTargets.filter((item) => item.desired && item.status === "READY").length;
   const readyUserLpmCount = data.userLpmTargets.filter((item) => item.desired && item.status === "READY").length;
