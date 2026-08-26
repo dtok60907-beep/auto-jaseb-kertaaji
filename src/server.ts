@@ -694,6 +694,7 @@ app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: str
   worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
   syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
+  if (buyer.broadcastActive) broadcast.nextSendAt = now();
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; buyer.updatedAt = now(); await save(store);
   return { ok: true, broadcast };
 });
@@ -720,6 +721,10 @@ app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: str
   let groups: string[]; try { groups = cleanGroups(req.body?.groups, maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST")); } catch (error) { return reply.code(400).send({ error: "groups_invalid", reason: (error as Error).message }); }
   syncLpmTargets(store, buyer, buyer.id, "BUYER", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "BUYER", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
+  // Simpan setup saat toggle Auto Sebar sedang ON harus langsung menjadwalkan
+  // kirim ulang. Tanpa ini, broadcast baru lahir TANPA nextSendAt sehingga
+  // tidak pernah dikirim lagi walaupun toggle tetap ON (laporan buyer).
+  if (buyer.userBroadcastActive) broadcast.nextSendAt = now();
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "BUYER"), broadcast]; unlockUserBroadcast(buyer, "BUYER"); buyer.updatedAt = now(); await save(store);
   return { ok: true, broadcast };
 });
@@ -746,6 +751,7 @@ app.put<{ Params: { id: string }; Body: { mode?: "TEXT" | "FORWARD"; wording?: s
   let groups: string[]; try { groups = cleanGroups(req.body?.groups, maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST")); } catch (error) { return reply.code(400).send({ error: "groups_invalid", reason: (error as Error).message }); }
   syncLpmTargets(store, buyer, buyer.id, "BUYER", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "BUYER", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
+  if (buyer.userBroadcastActive) broadcast.nextSendAt = now();
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "BUYER"), broadcast]; unlockUserBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
   return { ok: true, buyer, broadcast };
 });
@@ -871,8 +877,10 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: strin
 
 app.get<{ Querystring: { buyerId?: string } }>("/api/internal/comment-monitor", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const buyerId = String(req.query.buyerId ?? ""); const store = await load(); const buyer = store.buyers.find((item) => item.id === buyerId); const config = store.commentConfigs.find((item) => item.buyerId === buyerId);
-  if (!buyer || !config || !buyer.commentAccountConnected || !hasPlanAccess(store, buyer, "COMMENT")) return reply.code(404).send({ error: "comment_not_ready" });
-  return { buyerId, bases: config.bases, targets: store.commentTargets.filter((item) => item.buyerId === buyerId) };
+  // Polling rutin dari runner: belum siap adalah keadaan normal (buyer belum
+  // menyalakan Auto Komen), bukan galat — balas tenang supaya log bersih.
+  if (!buyer || !config || !buyer.commentAccountConnected || !hasPlanAccess(store, buyer, "COMMENT")) return { buyerId, ready: false as const, bases: [], targets: [] };
+  return { buyerId, ready: true as const, bases: config.bases, targets: store.commentTargets.filter((item) => item.buyerId === buyerId) };
 });
 
 app.get<{ Querystring: { workerId?: string } }>("/api/internal/worker-owner", { preHandler: lpmAdapterOnly }, async (req, reply) => {
@@ -1238,6 +1246,7 @@ app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?
     worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
     syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
     const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
+    if (buyer.broadcastActive) broadcast.nextSendAt = now();
     store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast];
   } else { buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"); }
   if (Boolean(req.body.planComment)) {
@@ -1273,6 +1282,7 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; 
   worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
   syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
+  if (buyer.broadcastActive) broadcast.nextSendAt = now();
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
   return { ok: true, buyer, broadcast };
 });
