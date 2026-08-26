@@ -333,7 +333,11 @@ function syncLpmTargets(store: Store, buyer: Buyer, executorId: string, executor
     if (existing) {
       const workerChanged = existing.workerId !== executorId;
       existing.desired = true; existing.workerId = executorId; existing.executor = executor;
-      if (workerChanged || existing.status === "REMOVING" || existing.status === "REMOVED" || existing.status === "READY" || existing.status === "UNAVAILABLE") { existing.status = "CONNECTING"; existing.note = undefined; }
+      // PENDING_APPROVAL ikut di-reset: permintaan join bisa saja tidak pernah
+      // disetujui admin grup, dan simpan ulang setup adalah satu-satunya cara
+      // buyer menyatakan "coba masuk lagi". Telegram menjawab INVITE_REQUEST_SENT
+      // lagi bila permintaan lama masih menggantung, jadi tidak ada spam.
+      if (workerChanged || existing.status === "REMOVING" || existing.status === "REMOVED" || existing.status === "READY" || existing.status === "UNAVAILABLE" || existing.status === "PENDING_APPROVAL") { existing.status = "CONNECTING"; existing.note = undefined; }
       existing.updatedAt = now();
       continue;
     }
@@ -341,6 +345,14 @@ function syncLpmTargets(store: Store, buyer: Buyer, executorId: string, executor
   }
 }
 function publicLpmTargets(store: Store, buyerId: string, executor?: Executor) { return store.lpmTargets.filter((item) => item.buyerId === buyerId && (!executor || targetExecutor(item) === executor) && (item.desired || item.status === "REMOVING") && item.status !== "REMOVED").sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
+const sessionErrorPattern = /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|CONCURRENT USAGE|authorization key/i;
+function reviveSessionPoisonedLpmTargets(store: Store, buyerId: string) {
+  // Dulu error level-session (AUTH_KEY_UNREGISTERED dsb.) sempat mencap grup
+  // individual sebagai UNAVAILABLE walau grupnya sebenarnya sehat. Saat akun
+  // berhasil tersambung lagi, korban seperti itu layak dicoba ulang — berbeda
+  // dari grup yang memang tidak bisa diakses (CHANNEL_PRIVATE dan kawan-kawan).
+  for (const target of store.lpmTargets) if (target.buyerId === buyerId && targetExecutor(target) === "BUYER" && target.desired && target.status === "UNAVAILABLE" && sessionErrorPattern.test(target.note ?? "")) { target.status = "CONNECTING"; delete target.note; target.updatedAt = now(); }
+}
 function notifyLpmStatus(store: Store, target: LpmTarget) {
   const buyer = store.buyers.find((item) => item.id === target.buyerId); if (!buyer?.telegramId || !bot) return;
   const text = ({ PENDING_APPROVAL: `@${target.username} menunggu persetujuan.`, READY: `@${target.username} siap dipakai.`, UNAVAILABLE: `@${target.username} tidak bisa dipakai.`, REMOVED: `@${target.username} dihapus.` } as Partial<Record<LpmTargetStatus, string>>)[target.status];
@@ -465,6 +477,12 @@ function cleanup(store: Store) {
     if (!access.userbotBroadcast) { buyer.userBroadcastActive = false; const broadcast = broadcastFor(store, buyer.id, "BUYER"); if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
     if (!access.comment) buyer.commentActive = false;
     if (!retainUserbotSession(access.comment, access.userbotBroadcast)) { buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "DISCONNECTED"; delete buyer.userbotAccountIssue; }
+    // Pulihan sisa bug lama: simpan setup saat toggle ON dulu melahirkan objek
+    // broadcast TANPA nextSendAt sehingga tidak pernah masuk antrean kirim lagi.
+    // Jadwalkan ulang broadcast aktif yang yatim supaya korban lama sembuh
+    // otomatis tanpa harus simpan ulang setup atau matikan-nyalakan toggle.
+    if (access.broadcast && buyer.broadcastActive) { const orphan = broadcastFor(store, buyer.id, "ADMIN"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) scheduleNextBroadcast(orphan, true); }
+    if (access.userbotBroadcast && buyer.userBroadcastActive) { const orphan = broadcastFor(store, buyer.id, "BUYER"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) scheduleNextBroadcast(orphan, true); }
   }
   const commentExpiredBuyerIds = new Set(store.buyers.filter((buyer) => shouldCancelCommentWork(hasPlanAccess(store, buyer, "COMMENT"))).map((buyer) => buyer.id));
   for (const job of store.commentJobs) if (commentExpiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
@@ -834,7 +852,7 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: strin
   if (!broadcast || !buyer || broadcast.deliveryToken !== String(req.body?.deliveryToken ?? "")) return reply.code(409).send({ error: "delivery_not_found" });
   const group = String(req.body?.group ?? "").replace(/^@/, ""); const failed = String(req.body?.error ?? "").trim(); const messageId = Number(req.body?.messageId);
   broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; broadcast.lastGroup = group || broadcast.lastGroup; broadcast.groupCursor = Math.max(0, Number(broadcast.groupCursor) || 0) + 1; scheduleNextBroadcast(broadcast);
-  if (failed) { store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() }); if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.username.toLowerCase() === group.toLowerCase()); if (target) { target.status = "UNAVAILABLE"; target.note = "Akun worker tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun worker tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); } else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain."); else if (/CHANNEL_PRIVATE|MESSAGE_ID_INVALID|MSG_ID_INVALID/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Link forward tidak bisa diakses akun worker. Pastikan post berasal dari channel publik dan link-nya benar."); else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`); }
+  if (failed) { req.log.warn({ buyerId: buyer.id, executor: "ADMIN", group, error: failed }, "Kirim broadcast gagal"); store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() }); if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.username.toLowerCase() === group.toLowerCase()); if (target) { target.status = "UNAVAILABLE"; target.note = "Akun worker tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun worker tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); } else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain."); else if (/CHANNEL_PRIVATE|MESSAGE_ID_INVALID|MSG_ID_INVALID/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Link forward tidak bisa diakses akun worker. Pastikan post berasal dari channel publik dan link-nya benar."); else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`); }
   else { broadcast.lastSentAt = now(); const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
   cleanup(store); await save(store); return { ok: true, nextSendAt: broadcast.nextSendAt };
 });
@@ -866,6 +884,9 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: strin
   const group = String(req.body?.group ?? "").replace(/^@/, ""); const failed = String(req.body?.error ?? "").trim(); const messageId = Number(req.body?.messageId);
   broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; broadcast.lastGroup = group || broadcast.lastGroup; broadcast.groupCursor = Math.max(0, Number(broadcast.groupCursor) || 0) + 1; scheduleNextBroadcast(broadcast);
   if (failed) {
+    // Alasan gagal asli dari Telegram hanya ada di sini — tanpa log ini,
+    // laporan "tidak bisa nyebar ke grup X" mustahil didiagnosis dari server.
+    req.log.warn({ buyerId: buyer.id, executor: "BUYER", group, error: failed }, "Kirim broadcast gagal");
     store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() });
     const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.username.toLowerCase() === group.toLowerCase());
     if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { if (target) { target.status = "UNAVAILABLE"; target.note = "Akun lo tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun lo tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); }
@@ -915,6 +936,7 @@ app.post<{ Body: { buyerId?: string; status?: UserbotAccountStatus; note?: strin
   if (status === "CONNECTED") {
     const changed = buyer.userbotAccountStatus !== "CONNECTED";
     buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue;
+    reviveSessionPoisonedLpmTargets(store, buyerId);
     if (changed) app.log.info({ buyerId }, "🟢 Akun userbot tersambung (laporan runner)");
   } else {
     const changed = buyer.userbotAccountStatus !== "RECONNECT_REQUIRED";
@@ -943,7 +965,7 @@ app.post<{ Body: { buyerId?: string; workerId?: string; chat?: string; type?: "M
 });
 
 async function clearPendingCommentLogin(buyerId: string) { const login = pendingCommentLogins.get(buyerId); pendingCommentLogins.delete(buyerId); if (login) await login.client.disconnect().catch(() => undefined); }
-async function finishCommentLogin(login: PendingCommentLogin, buyer: Buyer, store: Store) { const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan."); runnerRestartNotBefore.delete("userbot-host"); await saveCommentSession(buyer.id, session); buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue; buyer.updatedAt = now(); await save(store); pendingCommentLogins.delete(buyer.id); await login.client.disconnect(); void reconcileRunnersSafely(); }
+async function finishCommentLogin(login: PendingCommentLogin, buyer: Buyer, store: Store) { const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan."); runnerRestartNotBefore.delete("userbot-host"); await saveCommentSession(buyer.id, session); buyer.commentAccountConnected = true; buyer.userbotAccountStatus = "CONNECTED"; buyer.userbotLastSeenAt = now(); delete buyer.userbotAccountIssue; reviveSessionPoisonedLpmTargets(store, buyer.id); buyer.updatedAt = now(); await save(store); pendingCommentLogins.delete(buyer.id); await login.client.disconnect(); void reconcileRunnersSafely(); }
 
 app.post<{ Body: { phone?: string } }>("/api/buyer/comment-account/send-code", async (req, reply) => {
   const store = await load(); cleanup(store); const buyer = buyerForRequest(store, req);
