@@ -261,6 +261,11 @@ async function load(): Promise<Store> {
     }
     activitiesMigrated = true;
   }
+  // Aktivitas legacy sudah disalin ke app_buyer_state slot ACTIVITIES (di atas).
+  // Buang dari store supaya memori tidak membawa riwayat lama dan tiap save()
+  // tidak menulis-ulang ratusan item activity ke blob (meredakan egress & RAM).
+  delete (store as { activities?: unknown }).activities;
+  delete (ready as { activities?: unknown }).activities;
 
   // Paket lama BUNDLE sengaja tidak dijual lagi. Aksesnya tetap dipertahankan sebagai
   // legacy sampai habis, jadi tidak ada buyer lama yang berganti executor diam-diam.
