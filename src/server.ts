@@ -10,7 +10,7 @@ import fastifyStatic from "@fastify/static";
 import { Bot, InlineKeyboard } from "grammy";
 import { Api, TelegramClient, password as telegramPassword } from "teleproto";
 import { StringSession } from "teleproto/sessions/index.js";
-import { loadPersistentStore, readEncryptedSessions, removeEncryptedSession, saveEncryptedSession, savePersistentStore } from "./database.js";
+import { loadBuyerState, loadPersistentStore, readEncryptedSessions, removeEncryptedSession, saveBuyerState, saveEncryptedSession, savePersistentStore } from "./database.js";
 import { buyerWithEffectiveAccess, clearManualPlanAccess, extendedEndsAt, hasPlanAccess, productPlans, reconcileManualPlanFlags, retainUserbotSession, shouldCancelCommentWork, shouldNotifyExpiry, type Plan } from "./access.js";
 
 type Product = "ADMIN_BROADCAST" | "USERBOT_PROMO" | "LEGACY_BUNDLE";
@@ -19,7 +19,10 @@ type UserbotAccountStatus = "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "RECON
 type Buyer = { id: string; name: string; telegramId: string; broadcastActive: boolean; userBroadcastActive?: boolean; commentActive: boolean; commentAccountConnected: boolean; userbotAccountStatus?: UserbotAccountStatus; userbotAccountIssue?: string; userbotLastSeenAt?: string; planBroadcast: boolean; planUserBroadcast?: boolean; planComment: boolean; legacyBundle?: boolean; workerId: string | null; updatedAt: string; broadcastEditingBy?: CommentActor; broadcastEditingUntil?: string; userBroadcastEditingBy?: CommentActor; userBroadcastEditingUntil?: string };
 type Worker = { id: string; label: string; username: string; status: "AVAILABLE" | "ASSIGNED" | "COOLDOWN" | "DISABLED"; buyerId: string | null; cooldownUntil?: string; createdAt: string };
 type ForwardSource = { channel: string; messageId: number; showSource: boolean };
-type Broadcast = { buyerId: string; executor?: Executor; wording: string; mode: "TEXT" | "FORWARD"; forward?: ForwardSource; groups: string[]; intervalMinutes: number; updatedBy: "ADMIN" | "BUYER"; updatedAt: string; nextSendAt?: string; lastSentAt?: string; lastGroup?: string; groupCursor?: number; deliveryToken?: string; deliveryUntil?: string };
+// Field antrean panas (nextSendAt, kursor, token) TIDAK disimpan di sini —
+// semuanya pindah ke app_buyer_state (RUNTIME:*) dan memori proses supaya
+// setiap pengiriman tidak menulis-ulang seluruh blob store.
+type Broadcast = { buyerId: string; executor?: Executor; wording: string; mode: "TEXT" | "FORWARD"; forward?: ForwardSource; groups: string[]; intervalMinutes: number; updatedBy: "ADMIN" | "BUYER"; updatedAt: string };
 type LpmTargetStatus = "CONNECTING" | "PENDING_APPROVAL" | "READY" | "UNAVAILABLE" | "REMOVING" | "REMOVED";
 type LpmTarget = { id: string; buyerId: string; workerId: string; executor?: Executor; username: string; status: LpmTargetStatus; desired: boolean; note?: string; createdAt: string; updatedAt: string };
 type CommentDivision = { id: string; name: string; keywords: string[]; blacklist: string[]; wording: string };
@@ -39,7 +42,7 @@ type Subscription = { id: string; buyerId: string; packageId?: string; plan: Pla
 type WalletType = "DANA" | "GoPay" | "OVO" | "ShopeePay" | "LinkAja";
 type PayoutProfile = { telegramId: string; walletType: WalletType; walletNumber: string; walletOwner: string; updatedAt: string };
 type Withdrawal = { id: string; telegramId: string; grossAmount: number; fee: number; netAmount: number; walletType: WalletType; walletNumber: string; walletOwner: string; status: "REQUESTED" | "PAID"; createdAt: string; paidAt?: string };
-type Store = { buyers: Buyer[]; workers: Worker[]; broadcasts: Broadcast[]; lpmTargets: LpmTarget[]; commentConfigs: CommentConfig[]; commentTargets: CommentTarget[]; activities: Activity[]; approvalCandidates: Candidate[]; commentJobs: CommentJob[]; dedupe: { buyerId: string; base: string; messageId: string; at: string }[]; payments: Payment[]; withdrawals: Withdrawal[]; payoutProfiles: PayoutProfile[]; subscriptions: Subscription[]; packages: Package[] };
+type Store = { buyers: Buyer[]; workers: Worker[]; broadcasts: Broadcast[]; lpmTargets: LpmTarget[]; commentConfigs: CommentConfig[]; commentTargets: CommentTarget[]; approvalCandidates: Candidate[]; commentJobs: CommentJob[]; dedupe: { buyerId: string; base: string; messageId: string; at: string }[]; payments: Payment[]; withdrawals: Withdrawal[]; payoutProfiles: PayoutProfile[]; subscriptions: Subscription[]; packages: Package[] };
 type CommerceOrder = { id: string; orderId: string; buyer: string; plan: PaymentPlan; durationDays: number; maxGroups: number; amount: number; status: Payment["status"]; createdAt: string; paidAt?: string };
 type CommerceWithdrawal = Pick<Withdrawal, "id" | "grossAmount" | "fee" | "netAmount" | "walletType" | "walletNumber" | "walletOwner" | "status" | "createdAt" | "paidAt">;
 type Commerce = { today: number; week: number; month: number; paidCount: number; pendingBalance: number; availableBalance: number; requestedBalance: number; canRequestWithdrawal: boolean; orders: CommerceOrder[]; withdrawals: CommerceWithdrawal[]; netProfit: number };
@@ -241,7 +244,23 @@ const defaultPackages = (): Package[] => [];
 const selfServiceSubscriptionsEnabled = process.env.SELF_SERVICE_SUBSCRIPTIONS === "true";
 async function load(): Promise<Store> {
   const store = await loadPersistentStore<Partial<Store>>(dataFile, {});
-  const ready = { ...store, buyers: store.buyers ?? [], workers: store.workers ?? [], broadcasts: store.broadcasts ?? [], commentConfigs: store.commentConfigs ?? [], activities: store.activities ?? [], approvalCandidates: store.approvalCandidates ?? [], dedupe: store.dedupe ?? [], payments: store.payments ?? [], withdrawals: store.withdrawals ?? [], payoutProfiles: store.payoutProfiles ?? [], subscriptions: store.subscriptions ?? [], packages: store.packages ?? defaultPackages(), lpmTargets: store.lpmTargets ?? [], commentTargets: store.commentTargets ?? [], commentJobs: store.commentJobs ?? [] } as Store;
+  const ready = { ...store, buyers: store.buyers ?? [], workers: store.workers ?? [], broadcasts: store.broadcasts ?? [], commentConfigs: store.commentConfigs ?? [], approvalCandidates: store.approvalCandidates ?? [], dedupe: store.dedupe ?? [], payments: store.payments ?? [], withdrawals: store.withdrawals ?? [], payoutProfiles: store.payoutProfiles ?? [], subscriptions: store.subscriptions ?? [], packages: store.packages ?? defaultPackages(), lpmTargets: store.lpmTargets ?? [], commentTargets: store.commentTargets ?? [], commentJobs: store.commentJobs ?? [] } as Store;
+  // Migrasi satu kali: riwayat aktivitas lama pindah dari blob ke app_buyer_state
+  // per buyer supaya panel AKTIVITAS tidak kosong saat blob ditulis ulang tanpa
+  // kolom activities. Setelah penyimpanan pertama, blob sudah bersih dan blok
+  // ini berhenti jalan dengan sendirinya.
+  const legacyActivities = (store as any).activities;
+  if (!activitiesMigrated && Array.isArray(legacyActivities) && legacyActivities.length) {
+    const activityByBuyer = new Map<string, Activity[]>();
+    for (const item of legacyActivities) if (item && item.buyerId) {
+      const list = activityByBuyer.get(String(item.buyerId)) ?? []; list.push(item as Activity); activityByBuyer.set(String(item.buyerId), list);
+    }
+    for (const [buyerId, items] of activityByBuyer) {
+      const existing = await loadBuyerState<{ items?: Activity[] }>(buyerId, "ACTIVITIES", {});
+      if (!existing.items?.length) await saveBuyerState(buyerId, "ACTIVITIES", { items: items.sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 50) });
+    }
+    activitiesMigrated = true;
+  }
 
   // Paket lama BUNDLE sengaja tidak dijual lagi. Aksesnya tetap dipertahankan sebagai
   // legacy sampai habis, jadi tidak ada buyer lama yang berganti executor diam-diam.
@@ -267,7 +286,7 @@ async function load(): Promise<Store> {
         : item.plan === "BROADCAST" ? "ADMIN_BROADCAST" : "USERBOT_PROMO";
     return { ...item, packageId: item.packageId || undefined, plan: item.plan as Plan, product: inferredProduct, source: item.source === "MANUAL" ? "MANUAL" : "PAYMENT", maxGroups: Math.max(1, Math.floor(Number(item.maxGroups) || 15)), status: item.status === "REVOKED" ? "REVOKED" : item.status === "EXPIRED" ? "EXPIRED" : "ACTIVE", startsAt: item.startsAt ?? now(), endsAt: item.endsAt ?? now() } as Subscription;
   });
-  ready.broadcasts = (ready.broadcasts ?? []).map((item: any) => ({ ...item, executor: item.executor === "BUYER" ? "BUYER" : "ADMIN", mode: item.mode === "FORWARD" && item.forward ? "FORWARD" : "TEXT", forward: item.mode === "FORWARD" && item.forward ? { channel: String(item.forward.channel ?? ""), messageId: Number(item.forward.messageId), showSource: Boolean(item.forward.showSource) } : undefined, wording: String(item.wording ?? ""), intervalMinutes: broadcastInterval(item.intervalMinutes) }));
+  ready.broadcasts = (ready.broadcasts ?? []).map(({ deliveryToken, deliveryUntil, nextSendAt, lastSentAt, lastGroup, groupCursor, ...item }: any) => ({ ...item, executor: item.executor === "BUYER" ? "BUYER" : "ADMIN", mode: item.mode === "FORWARD" && item.forward ? "FORWARD" : "TEXT", forward: item.mode === "FORWARD" && item.forward ? { channel: String(item.forward.channel ?? ""), messageId: Number(item.forward.messageId), showSource: Boolean(item.forward.showSource) } : undefined, wording: String(item.wording ?? ""), intervalMinutes: broadcastInterval(item.intervalMinutes) }));
   ready.lpmTargets = ready.lpmTargets.map((item: any) => ({ ...item, executor: item.executor === "BUYER" ? "BUYER" : "ADMIN" }));
   ready.commentConfigs = (ready.commentConfigs ?? []).map((item: any) => ({ buyerId: item.buyerId, bases: item.bases ?? [], divisions: item.divisions ?? [{ id: id("division"), name: item.division ?? "Produk", keywords: item.keywords ?? [], blacklist: item.blacklist ?? [], wording: item.wording ?? "" }], mode: item.mode === "AUTO" ? "AUTO" : "APPROVAL", updatedAt: item.updatedAt ?? now(), updatedBy: item.updatedBy === "BUYER" ? "BUYER" : "ADMIN", ...(item.editingBy && item.editingUntil && Date.parse(item.editingUntil) > Date.now() ? { editingBy: item.editingBy === "BUYER" ? "BUYER" : "ADMIN", editingUntil: item.editingUntil } : {}) }));
   ready.approvalCandidates = (ready.approvalCandidates ?? []).map((item: any) => ({ ...item, wording: String(item.wording ?? ready.commentConfigs.find((config) => config.buyerId === item.buyerId)?.divisions[0]?.wording ?? ""), preview: String(item.preview ?? "") }));
@@ -395,7 +414,65 @@ function unlockBroadcast(buyer: Buyer, actor: CommentActor) { if (buyer.broadcas
 function userBroadcastLock(buyer: Buyer, actor: CommentActor) { const locked = buyer.userBroadcastEditingBy && buyer.userBroadcastEditingUntil && Date.parse(buyer.userBroadcastEditingUntil) > Date.now(); if (locked && buyer.userBroadcastEditingBy !== actor) throw new Error(buyer.userBroadcastEditingBy === "ADMIN" ? "Setup sedang diatur admin." : "Setup sedang diatur buyer."); buyer.userBroadcastEditingBy = actor; buyer.userBroadcastEditingUntil = new Date(Date.now() + 10 * 60_000).toISOString(); return buyer; }
 function requireUserBroadcastLock(buyer: Buyer, actor: CommentActor) { if (buyer.userBroadcastEditingBy !== actor || !buyer.userBroadcastEditingUntil || Date.parse(buyer.userBroadcastEditingUntil) <= Date.now()) throw new Error("Buka pengaturan dulu sebelum menyimpan."); }
 function unlockUserBroadcast(buyer: Buyer, actor: CommentActor) { if (buyer.userBroadcastEditingBy === actor) { delete buyer.userBroadcastEditingBy; delete buyer.userBroadcastEditingUntil; } }
-function scheduleNextBroadcast(broadcast: Broadcast, immediate = false) { broadcast.nextSendAt = immediate ? now() : new Date(Date.now() + broadcast.intervalMinutes * 60_000).toISOString(); broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; }
+// ---------------------------------------------------------------------------
+// Runtime pengiriman per buyer+executor. Disimpan di app_buyer_state (baris
+// kecil), BUKAN di blob store: tiap kirim hanya menyentuh ±ratusan byte, bukan
+// menulis-ulang seluruh state semua user. Cache proses aman karena server ini
+// satu-satunya penulis.
+// ---------------------------------------------------------------------------
+type SendRuntime = { nextSendAt?: string; lastSentAt?: string; lastGroup?: string; groupCursor?: number };
+const sendRuntimeCache = new Map<string, SendRuntime>();
+// Migrasi one-time dari blob → app_buyer_state berjalan sekali per proses.
+let activitiesMigrated = false;
+// Token pengiriman sengaja VOLATILE (hanya memori): tidak ada nilai bisnis yang
+// hilang saat restart — kirim yang menggantung cukup gagal sekali lalu dicoba
+// ulang pada siklus berikutnya. Dulu setiap token ikut terbawa PATCH blob 800KB.
+const activeDeliveries = new Map<string, { token: string; until: number }>();
+const DELIVERY_TTL_MS = 2 * 60_000;
+function runtimeKey(buyerId: string, executor: Executor) { return `${buyerId}|${executor}`; }
+async function loadSendRuntime(buyerId: string, executor: Executor): Promise<SendRuntime> {
+  const key = runtimeKey(buyerId, executor);
+  const cached = sendRuntimeCache.get(key);
+  if (cached) return cached;
+  const value = await loadBuyerState<SendRuntime>(buyerId, "RUNTIME:" + executor, {});
+  sendRuntimeCache.set(key, value);
+  return value;
+}
+async function mutateSendRuntime(buyerId: string, executor: Executor, mutate: (runtime: SendRuntime) => void): Promise<SendRuntime> {
+  const runtime = await loadSendRuntime(buyerId, executor);
+  mutate(runtime);
+  await saveBuyerState(buyerId, "RUNTIME:" + executor, runtime);
+  return runtime;
+}
+async function scheduleNextSend(buyerId: string, executor: Executor, intervalMinutes: number, immediate = false) {
+  return mutateSendRuntime(buyerId, executor, (runtime) => { runtime.nextSendAt = immediate ? now() : new Date(Date.now() + Math.max(1, intervalMinutes) * 60_000).toISOString(); });
+}
+async function clearSendSchedule(buyerId: string, executor: Executor) {
+  activeDeliveries.delete(runtimeKey(buyerId, executor));
+  return mutateSendRuntime(buyerId, executor, (runtime) => { delete runtime.nextSendAt; });
+}
+function armDelivery(buyerId: string, executor: Executor): string | undefined {
+  const key = runtimeKey(buyerId, executor);
+  const current = activeDeliveries.get(key);
+  if (current && current.until > Date.now()) return undefined;
+  const token = id("send");
+  activeDeliveries.set(key, { token, until: Date.now() + DELIVERY_TTL_MS });
+  return token;
+}
+function deliveryMatches(buyerId: string, executor: Executor, token: unknown): boolean {
+  const current = activeDeliveries.get(runtimeKey(buyerId, executor));
+  return Boolean(current && current.token === String(token ?? ""));
+}
+
+// Aktivitas ditulis ke baris ACTIVITIES milik buyer masing-masing (maks. 50
+// terbaru / 14 hari) — append-only ala broadcast_logs NEXO, tanpa menyentuh
+// blob store.
+async function appendActivity(buyerId: string, item: Omit<Activity, "buyerId">) {
+  const current = await loadBuyerState<{ items?: Activity[] }>(buyerId, "ACTIVITIES", {});
+  const cutoff = Date.now() - 14 * 86_400_000;
+  const items = [{ ...item, buyerId }, ...(current.items ?? [])].filter((entry) => Date.parse(entry.at) > cutoff).slice(0, 50);
+  await saveBuyerState(buyerId, "ACTIVITIES", { items });
+}
 function broadcastInterval(value: unknown) { return Math.max(1, Math.floor(Number(value) || 15)); }
 function cleanBroadcastWording(value: unknown) { const wording = String(value ?? ""); if (!wording.trim()) throw new Error("Isi wording promosi dulu."); if (Array.from(wording).length > 4096 || Buffer.byteLength(wording, "utf8") > 35_000) throw new Error("Wording terlalu panjang untuk dikirim Telegram."); return wording; }
 function parseForwardSource(value: unknown, showSource: unknown): ForwardSource { const raw = String(value ?? "").trim(); const match = raw.match(/^(?:https?:\/\/)?(?:t\.me|telegram\.me)\/([A-Za-z][A-Za-z0-9_]{3,})\/([1-9]\d*)\/?(?:\?[^\s]*)?$/i); if (!match) throw new Error("Tempel link bubble chat dari channel publik, contoh t.me/namachannel/123."); return { channel: match[1], messageId: Number(match[2]), showSource: Boolean(showSource) }; }
@@ -486,15 +563,12 @@ function cleanup(store: Store) {
     if (!ownsSubscription) continue;
     const access = reconcileManualPlanFlags(store, buyer);
     if (!access.broadcast) { changed = true; buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); }
-    if (!access.userbotBroadcast) { changed = true; buyer.userBroadcastActive = false; const broadcast = broadcastFor(store, buyer.id, "BUYER"); if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
+    if (!access.userbotBroadcast) { changed = true; buyer.userBroadcastActive = false; }
     if (!access.comment) { changed = true; buyer.commentActive = false; }
     if (!retainUserbotSession(access.comment, access.userbotBroadcast)) { changed = true; buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "DISCONNECTED"; delete buyer.userbotAccountIssue; }
-    // Pulihan sisa bug lama: simpan setup saat toggle ON dulu melahirkan objek
-    // broadcast TANPA nextSendAt sehingga tidak pernah masuk antrean kirim lagi.
-    // Jadwalkan ulang broadcast aktif yang yatim supaya korban lama sembuh
-    // otomatis tanpa harus simpan ulang setup atau matikan-nyalakan toggle.
-    if (access.broadcast && buyer.broadcastActive) { const orphan = broadcastFor(store, buyer.id, "ADMIN"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) { scheduleNextBroadcast(orphan, true); changed = true; } }
-    if (access.userbotBroadcast && buyer.userBroadcastActive) { const orphan = broadcastFor(store, buyer.id, "BUYER"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) { scheduleNextBroadcast(orphan, true); changed = true; } }
+    // Jadwal kirim & token TIDAK dibersihkan di sini lagi: endpoint dispatch
+    // selalu mengecek ulang akses + toggle sebelum menyerahkan pekerjaan, dan
+    // jadwal yang hilang otomatis dianggap jatuh tempo (self-heal tanpa tulis).
   }
   const commentExpiredBuyerIds = new Set(store.buyers.filter((buyer) => shouldCancelCommentWork(hasPlanAccess(store, buyer, "COMMENT"))).map((buyer) => buyer.id));
   for (const job of store.commentJobs) if (commentExpiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { changed = true; job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
@@ -523,13 +597,10 @@ function cleanup(store: Store) {
   for (const item of store.approvalCandidates.filter((item) => Date.parse(item.createdAt) > ago(1))) freshCandidates.set(item.buyerId, [...(freshCandidates.get(item.buyerId) ?? []), item]);
   store.approvalCandidates = [...freshCandidates.values()].flatMap((items) => items.sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt)).slice(0, 40));
   store.dedupe = store.dedupe.filter((item) => Date.parse(item.at) > ago(2));
-  const byBuyer = new Map<string, Activity[]>();
-  for (const item of store.activities.filter((item) => Date.parse(item.at) > ago(14))) byBuyer.set(item.buyerId, [...(byBuyer.get(item.buyerId) ?? []), item]);
-  const activitiesBefore = store.activities.length;
-  store.activities = [...byBuyer.values()].flatMap((items) => items.sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 50));
-  // Filter di atas hanya mengurangi jumlah elemen, jadi perbandingan panjang
-  // cukup untuk mendeteksi apakah prune benar-benar membuang sesuatu.
-  if (store.commentJobs.length !== jobsBefore || store.approvalCandidates.length !== candidatesBefore || store.dedupe.length !== dedupeBefore || store.activities.length !== activitiesBefore) changed = true;
+  // Aktivitas TIDAK ada di store lagi — hidup di app_buyer_state per buyer.
+  // Filter hanya mengurangi elemen, jadi perbandingan panjang cukup untuk
+  // mendeteksi apakah prune benar-benar membuang sesuatu.
+  if (store.commentJobs.length !== jobsBefore || store.approvalCandidates.length !== candidatesBefore || store.dedupe.length !== dedupeBefore) changed = true;
   return changed;
 }
 
@@ -616,7 +687,7 @@ app.get("/api/buyer/dashboard", async (req, reply) => {
     userLpmTargets: publicLpmTargets(store, buyer.id, "BUYER"),
     commentTargets: store.commentTargets.filter((item) => item.buyerId === buyer.id),
     comment: store.commentConfigs.find((item) => item.buyerId === buyer.id) ?? null,
-    activity: store.activities.filter((item) => item.buyerId === buyer.id).sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 12),
+    activity: (await loadBuyerState<{ items?: Activity[] }>(buyer.id, "ACTIVITIES", {})).items?.slice(0, 12) ?? [],
   };
 });
 
@@ -713,14 +784,14 @@ app.post<{ Body: { feature: "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT"; activ
     const ready = hasPlanAccess(store, buyer, "BROADCAST") && buyer.workerId && Boolean(broadcastFor(store, buyer.id, "ADMIN")) && store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired && item.status === "READY");
     if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: "Belum ada grup yang siap dipakai." });
     buyer.broadcastActive = req.body.active;
-    const broadcast = broadcastFor(store, buyer.id, "ADMIN");
-    if (broadcast) { if (req.body.active) scheduleNextBroadcast(broadcast, true); else { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
+    if (req.body.active) await scheduleNextSend(buyer.id, "ADMIN", broadcastFor(store, buyer.id, "ADMIN")?.intervalMinutes ?? 15, true);
+    else await clearSendSchedule(buyer.id, "ADMIN");
   } else if (feature === "USERBOT_BROADCAST") {
     const ready = hasPlanAccess(store, buyer, "USERBOT_BROADCAST") && buyer.commentAccountConnected && Boolean(broadcastFor(store, buyer.id, "BUYER")) && store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.desired && item.status === "READY");
     if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: "Hubungkan akun dan siapkan grup LPM dulu." });
     buyer.userBroadcastActive = req.body.active;
-    const broadcast = broadcastFor(store, buyer.id, "BUYER");
-    if (broadcast) { if (req.body.active) scheduleNextBroadcast(broadcast, true); else { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
+    if (req.body.active) await scheduleNextSend(buyer.id, "BUYER", broadcastFor(store, buyer.id, "BUYER")?.intervalMinutes ?? 15, true);
+    else await clearSendSchedule(buyer.id, "BUYER");
   } else {
     const configured = store.commentConfigs.some((item) => item.buyerId === buyer.id);
     const targetReady = store.commentTargets.some((item) => item.buyerId === buyer.id && item.status === "READY");
@@ -750,8 +821,8 @@ app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: str
   worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
   syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
-  if (buyer.broadcastActive) broadcast.nextSendAt = now();
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; buyer.updatedAt = now(); await save(store);
+  if (buyer.broadcastActive) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
   return { ok: true, broadcast };
 });
 
@@ -778,10 +849,10 @@ app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: str
   syncLpmTargets(store, buyer, buyer.id, "BUYER", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "BUYER", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
   // Simpan setup saat toggle Auto Sebar sedang ON harus langsung menjadwalkan
-  // kirim ulang. Tanpa ini, broadcast baru lahir TANPA nextSendAt sehingga
-  // tidak pernah dikirim lagi walaupun toggle tetap ON (laporan buyer).
-  if (buyer.userBroadcastActive) broadcast.nextSendAt = now();
+  // kirim ulang. Tanpa ini, broadcast baru lahir TANPA jadwal sehingga tidak
+  // pernah dikirim lagi walaupun toggle tetap ON (laporan buyer).
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "BUYER"), broadcast]; unlockUserBroadcast(buyer, "BUYER"); buyer.updatedAt = now(); await save(store);
+  if (buyer.userBroadcastActive) await scheduleNextSend(buyer.id, "BUYER", broadcast.intervalMinutes, true);
   return { ok: true, broadcast };
 });
 
@@ -807,8 +878,8 @@ app.put<{ Params: { id: string }; Body: { mode?: "TEXT" | "FORWARD"; wording?: s
   let groups: string[]; try { groups = cleanGroups(req.body?.groups, maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST")); } catch (error) { return reply.code(400).send({ error: "groups_invalid", reason: (error as Error).message }); }
   syncLpmTargets(store, buyer, buyer.id, "BUYER", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "BUYER", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
-  if (buyer.userBroadcastActive) broadcast.nextSendAt = now();
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "BUYER"), broadcast]; unlockUserBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
+  if (buyer.userBroadcastActive) await scheduleNextSend(buyer.id, "BUYER", broadcast.intervalMinutes, true);
   return { ok: true, buyer, broadcast };
 });
 
@@ -867,32 +938,45 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/broadcast-jobs", 
     if (broadcastExecutor(broadcast) !== "ADMIN") continue;
     const buyer = store.buyers.find((item) => item.id === broadcast.buyerId);
     if (!buyer || buyer.workerId !== workerId || !buyer.broadcastActive || !hasPlanAccess(store, buyer, "BROADCAST")) continue;
-    if (broadcast.deliveryToken && broadcast.deliveryUntil && Date.parse(broadcast.deliveryUntil) > Date.now()) continue;
-    if (!broadcast.nextSendAt || Date.parse(broadcast.nextSendAt) > Date.now()) continue;
+    if ((activeDeliveries.get(runtimeKey(buyer.id, "ADMIN"))?.until ?? 0) > Date.now()) continue;
+    const runtime = await loadSendRuntime(buyer.id, "ADMIN");
+    // Jadwal yang hilang dianggap jatuh tempo (self-heal) — lokasi paling murah
+    // untuk menyembuhkan jadwal kosong tanpa tulis apa pun ke penyimpanan.
+    if (runtime.nextSendAt && Date.parse(runtime.nextSendAt) > Date.now()) continue;
     const readyGroups = broadcast.groups.filter((username) => store.lpmTargets.some((target) => target.buyerId === buyer.id && target.workerId === workerId && target.desired && target.status === "READY" && target.username.toLowerCase() === username.toLowerCase()));
     if (!readyGroups.length) continue;
-    const cursor = Math.max(0, Number(broadcast.groupCursor) || 0) % readyGroups.length; const group = readyGroups[cursor]; const deliveryToken = id("send");
-    broadcast.deliveryToken = deliveryToken; broadcast.deliveryUntil = new Date(Date.now() + 2 * 60_000).toISOString(); jobs.push({ buyerId: buyer.id, deliveryToken, group, wording: broadcast.wording, mode: broadcast.mode, forward: broadcast.forward });
+    const cursor = Math.max(0, Number(runtime.groupCursor) || 0) % readyGroups.length; const group = readyGroups[cursor];
+    const token = armDelivery(buyer.id, "ADMIN"); if (!token) continue;
+    jobs.push({ buyerId: buyer.id, deliveryToken: token, group, wording: broadcast.wording, mode: broadcast.mode, forward: broadcast.forward });
   }
-  await save(store); return { jobs };
+  // Tidak ada penulisan store di sini lagi: token & kursor hidup di memori dan
+  // app_buyer_state, jadi polling worker tidak pernah menyentuh blob 800KB.
+  return { jobs };
 });
 
 app.post<{ Params: { id: string }; Body: { deliveryToken?: string; workerId?: string; group?: string } }>("/api/internal/broadcast-jobs/:id/confirm", { preHandler: lpmAdapterOnly }, async (req) => {
   const store = await load(); cleanup(store); const broadcast = broadcastFor(store, req.params.id, "ADMIN"); const buyer = store.buyers.find((item) => item.id === req.params.id); const workerId = String(req.body?.workerId ?? ""); const group = String(req.body?.group ?? "").replace(/^@/, "").toLowerCase();
   const targetReady = Boolean(buyer && store.lpmTargets.some((item) => item.buyerId === buyer.id && item.workerId === workerId && item.desired && item.status === "READY" && item.username.toLowerCase() === group));
-  const allowed = Boolean(broadcast && buyer && broadcast.deliveryToken === String(req.body?.deliveryToken ?? "") && buyer.workerId === workerId && buyer.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
-  if (!allowed && broadcast?.deliveryToken === String(req.body?.deliveryToken ?? "")) { broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; if (buyer?.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST")) scheduleNextBroadcast(broadcast, true); await save(store); }
+  const tokenOk = deliveryMatches(req.params.id, "ADMIN", req.body?.deliveryToken);
+  const allowed = Boolean(broadcast && buyer && tokenOk && buyer.workerId === workerId && buyer.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
+  if (!allowed && tokenOk && broadcast && buyer?.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST")) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
   return { send: allowed };
 });
 
 app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: string; messageId?: number; error?: string } }>("/api/internal/broadcast-jobs/:id/result", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const store = await load(); const broadcast = broadcastFor(store, req.params.id, "ADMIN"); const buyer = store.buyers.find((item) => item.id === req.params.id);
-  if (!broadcast || !buyer || broadcast.deliveryToken !== String(req.body?.deliveryToken ?? "")) return reply.code(409).send({ error: "delivery_not_found" });
+  if (!broadcast || !buyer || !deliveryMatches(req.params.id, "ADMIN", req.body?.deliveryToken)) return reply.code(409).send({ error: "delivery_not_found" });
+  activeDeliveries.delete(runtimeKey(buyer.id, "ADMIN"));
   const group = String(req.body?.group ?? "").replace(/^@/, ""); const failed = String(req.body?.error ?? "").trim(); const messageId = Number(req.body?.messageId);
-  broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; broadcast.lastGroup = group || broadcast.lastGroup; broadcast.groupCursor = Math.max(0, Number(broadcast.groupCursor) || 0) + 1; scheduleNextBroadcast(broadcast);
-  if (failed) { req.log.warn({ buyerId: buyer.id, executor: "ADMIN", group, error: failed }, "Kirim broadcast gagal"); store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() }); if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.username.toLowerCase() === group.toLowerCase()); if (target) { target.status = "UNAVAILABLE"; target.note = "Akun worker tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun worker tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); } else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain."); else if (/CHANNEL_PRIVATE|MESSAGE_ID_INVALID|MSG_ID_INVALID/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Link forward tidak bisa diakses akun worker. Pastikan post berasal dari channel publik dan link-nya benar."); else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`); }
-  else { broadcast.lastSentAt = now(); const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
-  cleanup(store); await save(store); return { ok: true, nextSendAt: broadcast.nextSendAt };
+  await mutateSendRuntime(buyer.id, "ADMIN", (runtime) => {
+    runtime.nextSendAt = new Date(Date.now() + broadcast.intervalMinutes * 60_000).toISOString();
+    runtime.lastGroup = group || runtime.lastGroup;
+    runtime.groupCursor = Math.max(0, Number(runtime.groupCursor) || 0) + 1;
+    if (!failed) runtime.lastSentAt = now();
+  });
+  if (failed) { req.log.warn({ buyerId: buyer.id, executor: "ADMIN", group, error: failed }, "Kirim broadcast gagal"); await appendActivity(buyer.id, { kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() }); if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.username.toLowerCase() === group.toLowerCase()); if (target) { target.status = "UNAVAILABLE"; target.note = "Akun worker tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun worker tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); } else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain."); else if (/CHANNEL_PRIVATE|MESSAGE_ID_INVALID|MSG_ID_INVALID/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Link forward tidak bisa diakses akun worker. Pastikan post berasal dari channel publik dan link-nya benar."); else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`); }
+  else { const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; await appendActivity(buyer.id, { kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
+  cleanup(store); await save(store); const runtime = await loadSendRuntime(buyer.id, "ADMIN"); return { ok: true, nextSendAt: runtime.nextSendAt };
 });
 
 // Jalur kirim khusus Userbot Promosi. Sengaja dipisah dari endpoint worker agar
@@ -901,37 +985,45 @@ app.get<{ Querystring: { buyerId?: string } }>("/api/internal/userbot-broadcast-
   const buyerId = String(req.query.buyerId ?? ""); const store = await load(); cleanup(store);
   const buyer = store.buyers.find((item) => item.id === buyerId); const broadcast = broadcastFor(store, buyerId, "BUYER");
   if (!buyer || !broadcast || !buyer.userBroadcastActive || !buyer.commentAccountConnected || !hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return { jobs: [] };
-  if (broadcast.deliveryToken && broadcast.deliveryUntil && Date.parse(broadcast.deliveryUntil) > Date.now()) return { jobs: [] };
-  if (!broadcast.nextSendAt || Date.parse(broadcast.nextSendAt) > Date.now()) return { jobs: [] };
+  if ((activeDeliveries.get(runtimeKey(buyerId, "BUYER"))?.until ?? 0) > Date.now()) return { jobs: [] };
+  const runtime = await loadSendRuntime(buyerId, "BUYER");
+  if (runtime.nextSendAt && Date.parse(runtime.nextSendAt) > Date.now()) return { jobs: [] };
   const readyGroups = broadcast.groups.filter((username) => store.lpmTargets.some((target) => target.buyerId === buyer.id && targetExecutor(target) === "BUYER" && target.workerId === buyer.id && target.desired && target.status === "READY" && target.username.toLowerCase() === username.toLowerCase()));
   if (!readyGroups.length) return { jobs: [] };
-  const cursor = Math.max(0, Number(broadcast.groupCursor) || 0) % readyGroups.length; const group = readyGroups[cursor]; const deliveryToken = id("send");
-  broadcast.deliveryToken = deliveryToken; broadcast.deliveryUntil = new Date(Date.now() + 2 * 60_000).toISOString(); await save(store);
-  return { jobs: [{ buyerId: buyer.id, deliveryToken, group, wording: broadcast.wording, mode: broadcast.mode, forward: broadcast.forward }] };
+  const cursor = Math.max(0, Number(runtime.groupCursor) || 0) % readyGroups.length; const group = readyGroups[cursor];
+  const token = armDelivery(buyerId, "BUYER"); if (!token) return { jobs: [] };
+  return { jobs: [{ buyerId: buyer.id, deliveryToken: token, group, wording: broadcast.wording, mode: broadcast.mode, forward: broadcast.forward }] };
 });
 app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: string } }>("/api/internal/userbot-broadcast-jobs/:id/confirm", { preHandler: lpmAdapterOnly }, async (req) => {
   const store = await load(); cleanup(store); const buyer = store.buyers.find((item) => item.id === req.params.id); const broadcast = broadcastFor(store, req.params.id, "BUYER"); const group = String(req.body?.group ?? "").replace(/^@/, "").toLowerCase();
   const targetReady = Boolean(buyer && store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.workerId === buyer.id && item.desired && item.status === "READY" && item.username.toLowerCase() === group));
-  const allowed = Boolean(broadcast && buyer && broadcast.deliveryToken === String(req.body?.deliveryToken ?? "") && buyer.userBroadcastActive && buyer.commentAccountConnected && hasPlanAccess(store, buyer, "USERBOT_BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
-  if (!allowed && broadcast?.deliveryToken === String(req.body?.deliveryToken ?? "")) { broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; if (buyer?.userBroadcastActive && hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) scheduleNextBroadcast(broadcast, true); await save(store); }
+  const tokenOk = deliveryMatches(req.params.id, "BUYER", req.body?.deliveryToken);
+  const allowed = Boolean(broadcast && buyer && tokenOk && buyer.userBroadcastActive && buyer.commentAccountConnected && hasPlanAccess(store, buyer, "USERBOT_BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
+  if (!allowed && tokenOk && broadcast && buyer?.userBroadcastActive && hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) await scheduleNextSend(buyer.id, "BUYER", broadcast.intervalMinutes, true);
   return { send: allowed };
 });
 app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: string; messageId?: number; error?: string } }>("/api/internal/userbot-broadcast-jobs/:id/result", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id); const broadcast = broadcastFor(store, req.params.id, "BUYER");
-  if (!broadcast || !buyer || broadcast.deliveryToken !== String(req.body?.deliveryToken ?? "")) return reply.code(409).send({ error: "delivery_not_found" });
+  if (!broadcast || !buyer || !deliveryMatches(req.params.id, "BUYER", req.body?.deliveryToken)) return reply.code(409).send({ error: "delivery_not_found" });
+  activeDeliveries.delete(runtimeKey(buyer.id, "BUYER"));
   const group = String(req.body?.group ?? "").replace(/^@/, ""); const failed = String(req.body?.error ?? "").trim(); const messageId = Number(req.body?.messageId);
-  broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; broadcast.lastGroup = group || broadcast.lastGroup; broadcast.groupCursor = Math.max(0, Number(broadcast.groupCursor) || 0) + 1; scheduleNextBroadcast(broadcast);
+  await mutateSendRuntime(buyer.id, "BUYER", (runtime) => {
+    runtime.nextSendAt = new Date(Date.now() + broadcast.intervalMinutes * 60_000).toISOString();
+    runtime.lastGroup = group || runtime.lastGroup;
+    runtime.groupCursor = Math.max(0, Number(runtime.groupCursor) || 0) + 1;
+    if (!failed) runtime.lastSentAt = now();
+  });
   if (failed) {
     // Alasan gagal asli dari Telegram hanya ada di sini — tanpa log ini,
     // laporan "tidak bisa nyebar ke grup X" mustahil didiagnosis dari server.
     req.log.warn({ buyerId: buyer.id, executor: "BUYER", group, error: failed }, "Kirim broadcast gagal");
-    store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() });
+    await appendActivity(buyer.id, { kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() });
     const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.username.toLowerCase() === group.toLowerCase());
     if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { if (target) { target.status = "UNAVAILABLE"; target.note = "Akun lo tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun lo tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); }
     else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain.");
     else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`);
-  } else { broadcast.lastSentAt = now(); const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; store.activities.unshift({ buyerId: buyer.id, kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
-  cleanup(store); await save(store); return { ok: true, nextSendAt: broadcast.nextSendAt };
+  } else { const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; await appendActivity(buyer.id, { kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
+  cleanup(store); await save(store); const runtime = await loadSendRuntime(buyer.id, "BUYER"); return { ok: true, nextSendAt: runtime.nextSendAt };
 });
 
 app.get<{ Querystring: { buyerId?: string } }>("/api/internal/comment-monitor", { preHandler: lpmAdapterOnly }, async (req, reply) => {
@@ -953,7 +1045,7 @@ app.post<{ Body: { buyerId?: string; base?: string; discussion?: string; status?
   const current = `${target.status}|${target.discussion ?? ""}|${target.note ?? ""}`;
   if (current !== previous && next !== "CHECKING") {
     const detail = ({ READY: target.discussion ? `Akun lo siap memantau channel dan grup diskusinya (@${target.discussion}).` : "Akun lo siap memantau base ini.", PENDING_APPROVAL: "Permintaan join sedang menunggu persetujuan.", UNAVAILABLE: "Akun lo tidak bisa masuk atau mengakses target ini.", MUTED: "Akun lo tidak bisa mengirim komentar di target ini." } as Record<CommentTargetStatus, string>)[next];
-    if (next === "UNAVAILABLE" || next === "MUTED") store.activities.unshift({ buyerId, kind: "COMMENT", status: "failed", label: `Komentar dijeda · @${base}`, at: now() });
+    if (next === "UNAVAILABLE" || next === "MUTED") await appendActivity(buyerId, { kind: "COMMENT", status: "failed", label: `Komentar dijeda · @${base}`, at: now() });
     sendBuyerAlert(store, buyerId, `Info Auto Komen · @${base}`, detail);
   }
   await save(store);
@@ -980,8 +1072,7 @@ app.post<{ Body: { buyerId?: string; status?: UserbotAccountStatus; note?: strin
     const changed = buyer.userbotAccountStatus !== "RECONNECT_REQUIRED";
     buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "RECONNECT_REQUIRED"; buyer.userbotAccountIssue = note || "Sesi akun sudah tidak aktif."; buyer.commentActive = false; buyer.userBroadcastActive = false;
     if (changed) app.log.warn({ buyerId, note }, "💀 Sesi akun userbot mati permanen; menunggu dihubungkan ulang oleh buyer");
-    const broadcast = broadcastFor(store, buyer.id, "BUYER");
-    if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; }
+    if (broadcastFor(store, buyer.id, "BUYER")) await clearSendSchedule(buyer.id, "BUYER");
     for (const job of store.commentJobs) if (job.buyerId === buyer.id && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
     removeSession = true;
     if (changed) sendBuyerAlert(store, buyer.id, "Hubungkan ulang akun", "Sesi Telegram lo sudah tidak aktif. Auto Sebar dan Auto Komen dijeda sampai akun dihubungkan lagi.");
@@ -1061,7 +1152,7 @@ app.post<{ Body: { buyerId?: string; base?: string; messageId?: string; link?: s
       sendApprovalAlert(store, candidate);
       return { action: "approval", candidate, wording: division.wording };
     }
-    store.activities.unshift({ buyerId: targetBuyer, kind: "COMMENT", status: "queued", label: `Komentar otomatis · @${base}`, link: String(body.link ?? ""), at: now() });
+    await appendActivity(targetBuyer, { kind: "COMMENT", status: "queued", label: `Komentar otomatis · @${base}`, link: String(body.link ?? ""), at: now() });
     cleanup(store); await save(store);
     return { action: "send_comment", wording: division.wording };
   } finally { incomingLeadLocks.delete(leadKey); }
@@ -1094,7 +1185,7 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; commentMessag
   const store = await load(); const job = store.commentJobs.find((item) => item.id === req.params.id);
   if (!job || job.status !== "SENDING" || job.deliveryToken !== String(req.body?.deliveryToken ?? "")) return reply.code(409).send({ error: "comment_delivery_not_found" });
   const error = String(req.body?.error ?? "").trim(); job.status = error ? "FAILED" : "DONE"; delete job.deliveryToken; delete job.deliveryUntil;
-  store.activities.unshift({ buyerId: job.buyerId, kind: "COMMENT", status: error ? "failed" : "sent", label: error ? `Komentar gagal · @${job.base}` : `Komentar terkirim · @${job.base}`, link: job.link, at: now() }); cleanup(store); await save(store); return { ok: true };
+  await appendActivity(job.buyerId, { kind: "COMMENT", status: error ? "failed" : "sent", label: error ? `Komentar gagal · @${job.base}` : `Komentar terkirim · @${job.base}`, link: job.link, at: now() }); cleanup(store); await save(store); return { ok: true };
 });
 
 app.post<{ Body: { buyerId?: string; base?: string; messageId?: string; commentMessageId?: string | number; wording?: string; link?: string; text?: string } }>("/api/internal/auto-comment-delivered", { preHandler: lpmAdapterOnly }, async (req, reply) => {
@@ -1106,7 +1197,7 @@ app.post<{ Body: { buyerId?: string; base?: string; messageId?: string; commentM
   const existing = store.commentJobs.find((item) => item.buyerId === buyerId && item.base.toLowerCase() === base.toLowerCase() && item.messageId === messageId && item.commentMessageId === commentMessageId);
   if (existing) return { ok: true, duplicate: true };
   const job: CommentJob = { id: id("comment"), buyerId, base, messageId, commentMessageId, wording: String(body.wording ?? ""), link: String(body.link ?? ""), preview: previewText(String(body.text ?? "")), status: "DONE", createdAt: now() };
-  store.commentJobs.push(job); store.activities.unshift({ buyerId, kind: "COMMENT", status: "sent", label: `Komentar otomatis · @${base}`, link: job.link, at: now() }); cleanup(store); await save(store); sendAutoCommentAlert(store, job);
+  store.commentJobs.push(job); await appendActivity(buyerId, { kind: "COMMENT", status: "sent", label: `Komentar otomatis · @${base}`, link: job.link, at: now() }); cleanup(store); await save(store); sendAutoCommentAlert(store, job);
   return { ok: true };
 });
 
@@ -1121,7 +1212,7 @@ app.post<{ Params: { id: string }; Body: { deleteToken?: string; error?: string 
   const store = await load(); const job = store.commentJobs.find((item) => item.id === req.params.id);
   if (!job || job.deleteToken !== String(req.body?.deleteToken ?? "")) return reply.code(409).send({ error: "comment_deletion_not_found" });
   const error = String(req.body?.error ?? "").trim(); job.status = error ? "DELETE_FAILED" : "DELETED"; delete job.deleteToken; delete job.deleteUntil;
-  store.activities.unshift({ buyerId: job.buyerId, kind: "COMMENT", status: error ? "delete_failed" : "deleted", label: error ? `Komentar belum terhapus · @${job.base}` : `Komentar dihapus · @${job.base}`, at: now() }); cleanup(store); await save(store); return { ok: true };
+  await appendActivity(job.buyerId, { kind: "COMMENT", status: error ? "delete_failed" : "deleted", label: error ? `Komentar belum terhapus · @${job.base}` : `Komentar dihapus · @${job.base}`, at: now() }); cleanup(store); await save(store); return { ok: true };
 });
 
 app.get("/api/admin/overview", { preHandler: adminOnly }, async () => {
@@ -1306,7 +1397,6 @@ app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?
     worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
     syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
     const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
-    if (buyer.broadcastActive) broadcast.nextSendAt = now();
     store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast];
   } else { buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"); }
   if (Boolean(req.body.planComment)) {
@@ -1314,7 +1404,9 @@ app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?
     const config: CommentConfig = { buyerId: buyer.id, bases: split(req.body.bases), divisions, mode: req.body.mode === "AUTO" ? "AUTO" : "APPROVAL", updatedAt: now(), updatedBy: "ADMIN" };
     store.commentConfigs = [...store.commentConfigs.filter((item) => item.buyerId !== buyer.id), config]; syncCommentTargets(store, buyer.id, config.bases);
   } else { buyer.commentActive = false; store.commentConfigs = store.commentConfigs.filter((item) => item.buyerId !== buyer.id); }
-  buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
+  buyer.updatedAt = now(); await save(store);
+  if (buyer.broadcastActive) { const current = broadcastFor(store, buyer.id, "ADMIN"); if (current) await scheduleNextSend(buyer.id, "ADMIN", current.intervalMinutes, true); }
+  return { ok: true, buyer };
 });
 
 // These are deliberately separate from the legacy all-in-one setup route above.
@@ -1342,8 +1434,8 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; 
   worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
   syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
-  if (buyer.broadcastActive) broadcast.nextSendAt = now();
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
+  if (buyer.broadcastActive) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
   return { ok: true, buyer, broadcast };
 });
 

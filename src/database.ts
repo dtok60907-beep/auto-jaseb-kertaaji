@@ -129,3 +129,64 @@ export async function removeEncryptedSession(kind: SessionKind, localFile: strin
 }
 
 export function usingSupabase() { return Boolean(supabase()); }
+
+// ---------------------------------------------------------------------------
+// State panas per buyer (aktivitas, antrean kirim) di tabel app_buyer_state.
+// Dipisah dari blob app_state supaya jalur tersibuk — setiap pengiriman
+// broadcast — menulis baris kecil per buyer alih-alih menulis-ulang SELURUH
+// state semua user. Pola yang sama dipakai tabel broadcast_logs di NEXO.
+// ---------------------------------------------------------------------------
+
+const buyerStateWriteCache = new Map<string, string>();
+const buyerStateFile = "data/buyer-state.json";
+
+function buyerKey(buyerId: string, slot: string) { return `${buyerId}|${slot}`; }
+
+export async function loadBuyerState<T>(buyerId: string, slot: string, fallback: T): Promise<T> {
+  const config = supabase();
+  if (!config) {
+    const all = await readLocal<Record<string, T>>(buyerStateFile, {});
+    return all[buyerKey(buyerId, slot)] ?? fallback;
+  }
+  const response = await supabaseRequest(config, `app_buyer_state?buyer_id=eq.${encodeURIComponent(buyerId)}&slot=eq.${encodeURIComponent(slot)}&select=state`, { headers: restHeaders(config) }, "Tidak bisa membaca state buyer");
+  const parsed = (await response.json()) as { state?: T }[];
+  return parsed[0]?.state ?? fallback;
+}
+
+/** Satu query untuk banyak buyer sekaligus (dipakai loop dispatch). */
+export async function loadBuyerStates(buyerIds: readonly string[], slot: string): Promise<Map<string, unknown>> {
+  const result = new Map<string, unknown>();
+  if (!buyerIds.length) return result;
+  const config = supabase();
+  if (!config) {
+    const all = await readLocal<Record<string, unknown>>(buyerStateFile, {});
+    for (const buyerId of buyerIds) { const value = all[buyerKey(buyerId, slot)]; if (value !== undefined) result.set(buyerId, value); }
+    return result;
+  }
+  const list = buyerIds.map((id) => `"${id}"`).join(",");
+  const response = await supabaseRequest(config, `app_buyer_state?buyer_id=in.(${encodeURIComponent(list)})&slot=eq.${encodeURIComponent(slot)}&select=buyer_id,state`, { headers: restHeaders(config) }, "Tidak bisa membaca state buyer");
+  const rows = (await response.json()) as { buyer_id: string; state: unknown }[];
+  for (const row of rows) result.set(row.buyer_id, row.state);
+  return result;
+}
+
+export async function saveBuyerState<T>(buyerId: string, slot: string, value: T) {
+  const serialized = JSON.stringify(value);
+  const cacheKey = buyerKey(buyerId, slot);
+  // Tulisan identik tidak dikirim — loop polling memanggil ini tanpa perubahan.
+  if (buyerStateWriteCache.get(cacheKey) === serialized) return;
+  const config = supabase();
+  if (!config) {
+    const all = await readLocal<Record<string, unknown>>(buyerStateFile, {});
+    all[cacheKey] = value;
+    await writeLocal(buyerStateFile, all);
+    buyerStateWriteCache.set(cacheKey, serialized);
+    return;
+  }
+  await supabaseRequest(config, "app_buyer_state?on_conflict=buyer_id,slot", {
+    method: "POST",
+    headers: restHeaders(config, { prefer: "resolution=merge-duplicates,return=minimal" }),
+    body: JSON.stringify([{ buyer_id: buyerId, slot, state: value, updated_at: new Date().toISOString() }]),
+  }, "Tidak bisa menyimpan state buyer");
+  buyerStateWriteCache.set(cacheKey, serialized);
+}
