@@ -48,7 +48,15 @@ const root = dirname(fileURLToPath(import.meta.url));
 const dataFile = join(root, "../data/store.json");
 const sessionsFile = join(root, "../data/worker-sessions.json");
 const commentSessionsFile = join(root, "../data/comment-sessions.json");
-const app = Fastify({ logger: true });
+// Polling internal runner (tiap 3-5 detik dari puluhan akun) menghasilkan
+// jutaan baris log per hari tanpa informasi apa pun. Request logging dimatikan
+// global lalu dinyalakan lagi manual HANYA untuk endpoint non-internal, jadi
+// log Railway tetap berisi hal yang penting: endpoint publik, error, dan
+// pesan operasional.
+const isInternalPath = (url = "") => url.startsWith("/api/internal/");
+const app = Fastify({ logger: true, disableRequestLogging: true });
+app.addHook("onRequest", async (request) => { if (!isInternalPath(request.url)) request.log.info({ method: request.method, url: request.url }, "incoming request"); });
+app.addHook("onResponse", async (request, reply) => { if (!isInternalPath(request.url)) request.log.info({ statusCode: reply.statusCode, responseTimeMs: Math.round(reply.elapsedTime * 100) / 100 }, "request completed"); });
 // GramJS kadang melempar "TIMEOUT" dari update-loop internal (getDifference) —
 // itu benign dan auto-retry. Tanpa tameng ini log produksi penuh noise
 // unhandledRejection padahal sistem sehat.
@@ -462,47 +470,67 @@ function releaseWorkerWhenGroupsCleared(store: Store, buyer: Buyer) {
   if (!stillLeaving) releaseWorker(store, buyer);
 }
 function cleanup(store: Store) {
-  const before = JSON.stringify(store);
+  // Deteksi perubahan pakai flag eksplisit, BUKAN membandingkan dua hasil
+  // JSON.stringify seluruh store: cleanup dipanggil di hampir semua endpoint
+  // dan tiap putaran rekonsiliasi, jadi serialisasi megabyte-an berulang kali
+  // murni pembakaran CPU dan tekanan GC.
+  let changed = false;
   const ago = (days: number) => Date.now() - days * 86_400_000;
   const expiredProducts = new Map<string, "ADMIN_BROADCAST" | "USERBOT_PROMO">();
   for (const subscription of store.subscriptions) if (subscription.status === "ACTIVE" && Date.parse(subscription.endsAt) <= Date.now()) {
-    subscription.status = "EXPIRED";
+    subscription.status = "EXPIRED"; changed = true;
     if (subscription.product === "ADMIN_BROADCAST" || subscription.product === "USERBOT_PROMO") expiredProducts.set(`${subscription.buyerId}:${subscription.product}`, subscription.product);
   }
   for (const buyer of store.buyers) {
     const ownsSubscription = store.subscriptions.some((item) => item.buyerId === buyer.id);
     if (!ownsSubscription) continue;
     const access = reconcileManualPlanFlags(store, buyer);
-    if (!access.broadcast) { buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); }
-    if (!access.userbotBroadcast) { buyer.userBroadcastActive = false; const broadcast = broadcastFor(store, buyer.id, "BUYER"); if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
-    if (!access.comment) buyer.commentActive = false;
-    if (!retainUserbotSession(access.comment, access.userbotBroadcast)) { buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "DISCONNECTED"; delete buyer.userbotAccountIssue; }
+    if (!access.broadcast) { changed = true; buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); }
+    if (!access.userbotBroadcast) { changed = true; buyer.userBroadcastActive = false; const broadcast = broadcastFor(store, buyer.id, "BUYER"); if (broadcast) { broadcast.nextSendAt = undefined; broadcast.deliveryToken = undefined; broadcast.deliveryUntil = undefined; } }
+    if (!access.comment) { changed = true; buyer.commentActive = false; }
+    if (!retainUserbotSession(access.comment, access.userbotBroadcast)) { changed = true; buyer.commentAccountConnected = false; buyer.userbotAccountStatus = "DISCONNECTED"; delete buyer.userbotAccountIssue; }
     // Pulihan sisa bug lama: simpan setup saat toggle ON dulu melahirkan objek
     // broadcast TANPA nextSendAt sehingga tidak pernah masuk antrean kirim lagi.
     // Jadwalkan ulang broadcast aktif yang yatim supaya korban lama sembuh
     // otomatis tanpa harus simpan ulang setup atau matikan-nyalakan toggle.
-    if (access.broadcast && buyer.broadcastActive) { const orphan = broadcastFor(store, buyer.id, "ADMIN"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) scheduleNextBroadcast(orphan, true); }
-    if (access.userbotBroadcast && buyer.userBroadcastActive) { const orphan = broadcastFor(store, buyer.id, "BUYER"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) scheduleNextBroadcast(orphan, true); }
+    if (access.broadcast && buyer.broadcastActive) { const orphan = broadcastFor(store, buyer.id, "ADMIN"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) { scheduleNextBroadcast(orphan, true); changed = true; } }
+    if (access.userbotBroadcast && buyer.userBroadcastActive) { const orphan = broadcastFor(store, buyer.id, "BUYER"); if (orphan && !orphan.nextSendAt && !(orphan.deliveryToken && orphan.deliveryUntil && Date.parse(orphan.deliveryUntil) > Date.now())) { scheduleNextBroadcast(orphan, true); changed = true; } }
   }
   const commentExpiredBuyerIds = new Set(store.buyers.filter((buyer) => shouldCancelCommentWork(hasPlanAccess(store, buyer, "COMMENT"))).map((buyer) => buyer.id));
-  for (const job of store.commentJobs) if (commentExpiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
+  for (const job of store.commentJobs) if (commentExpiredBuyerIds.has(job.buyerId) && (job.status === "PENDING" || job.status === "SENDING")) { changed = true; job.status = "CANCELED"; delete job.deliveryToken; delete job.deliveryUntil; }
+  const candidatesBefore = store.approvalCandidates.length;
   store.approvalCandidates = store.approvalCandidates.filter((item) => !commentExpiredBuyerIds.has(item.buyerId));
+  const dedupeBefore = store.dedupe.length;
   store.dedupe = store.dedupe.filter((item) => !commentExpiredBuyerIds.has(item.buyerId));
   for (const [key, product] of expiredProducts) {
     const [buyerId] = key.split(":"); const buyer = store.buyers.find((item) => item.id === buyerId);
     if (!buyer || productEntitlement(store, buyer, product).hasAccess) continue;
     const subscriptions = store.subscriptions.filter((item) => item.buyerId === buyer.id && item.product === product);
     if (!shouldNotifyExpiry(false, subscriptions.some((item) => item.expiryNotifiedAt))) continue;
+    changed = true;
     const markedAt = now(); for (const subscription of subscriptions) subscription.expiryNotifiedAt = markedAt;
     sendBuyerAlert(store, buyer.id, "Masa aktif habis", `${productLabel(product)} sudah tidak aktif. Hubungi admin untuk lanjut.`);
   }
-  store.approvalCandidates = store.approvalCandidates.filter((item) => Date.parse(item.createdAt) > ago(2));
-  store.commentJobs = store.commentJobs.filter((item) => Date.parse(item.createdAt) > ago(30));
-  store.dedupe = store.dedupe.filter((item) => Date.parse(item.at) > ago(7));
+  // Store di-PATCH ULENG ke Supabase setiap ada perubahan, jadi ukurannya
+  // langsung jadi biaya egress. Riwayat yang sudah tidak berguna dipangkas
+  // agresif: job komentar selesai cukup digendong 24 jam (cukup untuk link
+  // hapus-komentar), kandidat approval dibatasi jumlahnya per buyer supaya
+  // buyer yang jarang membuka Mini App tidak menimbun ratusan entri.
+  const liveJobStatuses = new Set(["PENDING", "SENDING", "DELETE_PENDING", "DELETING"]);
+  const jobsBefore = store.commentJobs.length;
+  store.commentJobs = store.commentJobs.filter((item) => liveJobStatuses.has(item.status) || Date.parse(item.createdAt) > ago(1));
+  const freshCandidates = new Map<string, Candidate[]>();
+  for (const item of store.approvalCandidates.filter((item) => Date.parse(item.createdAt) > ago(1))) freshCandidates.set(item.buyerId, [...(freshCandidates.get(item.buyerId) ?? []), item]);
+  store.approvalCandidates = [...freshCandidates.values()].flatMap((items) => items.sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt)).slice(0, 40));
+  store.dedupe = store.dedupe.filter((item) => Date.parse(item.at) > ago(2));
   const byBuyer = new Map<string, Activity[]>();
-  for (const item of store.activities.filter((item) => Date.parse(item.at) > ago(30))) byBuyer.set(item.buyerId, [...(byBuyer.get(item.buyerId) ?? []), item]);
-  store.activities = [...byBuyer.values()].flatMap((items) => items.sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 100));
-  return JSON.stringify(store) !== before;
+  for (const item of store.activities.filter((item) => Date.parse(item.at) > ago(14))) byBuyer.set(item.buyerId, [...(byBuyer.get(item.buyerId) ?? []), item]);
+  const activitiesBefore = store.activities.length;
+  store.activities = [...byBuyer.values()].flatMap((items) => items.sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 50));
+  // Filter di atas hanya mengurangi jumlah elemen, jadi perbandingan panjang
+  // cukup untuk mendeteksi apakah prune benar-benar membuang sesuatu.
+  if (store.commentJobs.length !== jobsBefore || store.approvalCandidates.length !== candidatesBefore || store.dedupe.length !== dedupeBefore || store.activities.length !== activitiesBefore) changed = true;
+  return changed;
 }
 
 async function reconcileRunners() {
@@ -528,8 +556,13 @@ async function reconcileRunners() {
       // kedua untuk Jaseb akun buyer karena dua koneksi dengan session yang sama bisa
       // membuat Telegram menolak auth key atau mengirim dobel.
       const allowed = Boolean(buyer && retainUserbotSession(hasPlanAccess(store, buyer, "COMMENT"), hasPlanAccess(store, buyer, "USERBOT_BROADCAST")));
-      if (buyer && buyer.commentAccountConnected && allowed) activeUserbotBuyers.push(buyerId);
-      else { await removeCommentSession(buyerId); if (buyer) buyer.commentAccountConnected = false; }
+      // Koneksi GramJS yang nganggur makan ratusan MB RAM. Akun dengan SEMUA
+      // layanan OFF dikeluarkan dari roster TANPA menghapus session-nya: flag
+      // commentAccountConnected tetap true supaya UI tetap anggap akun siap,
+      // dan begitu satu toggle dinyalakan rekonsiliasi menyalakan akunnya lagi.
+      const working = Boolean(buyer && (buyer.commentActive || buyer.userBroadcastActive));
+      if (buyer && buyer.commentAccountConnected && allowed && working) activeUserbotBuyers.push(buyerId);
+      else if (!allowed || !buyer?.commentAccountConnected) { await removeCommentSession(buyerId); if (buyer) buyer.commentAccountConnected = false; }
     }
     writeUserbotRoster(activeUserbotBuyers);
     if (activeUserbotBuyers.length) startUserbotRunner(); else stopUserbotRunner();
@@ -695,7 +728,12 @@ app.post<{ Body: { feature: "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT"; activ
     if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: !buyer.commentAccountConnected ? "Hubungkan akun Telegram lo dulu." : !configured ? "Lengkapi setup Auto Komen dulu." : "Menunggu base siap dipakai." });
     buyer.commentActive = req.body.active;
   }
-  buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
+  buyer.updatedAt = now(); await save(store);
+  // Toggle layanan userbot harus langsung mengubah roster koneksi: menyalakan
+  // menyambungkan akun secepatnya, mematikan melepas koneksinya tanpa nunggu
+  // rekonsilasi berkala 30 detik.
+  if (feature !== "BROADCAST") void reconcileRunnersSafely();
+  return { ok: true, buyer };
 });
 
 app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number } }>("/api/buyer/broadcast-setup", async (req, reply) => {
