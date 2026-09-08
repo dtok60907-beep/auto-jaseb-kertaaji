@@ -1,15 +1,16 @@
 # Client Promosi Lite
 
-MVP operasional Telegram: Auto Sebar memakai akun worker milik admin secara 1:1 per buyer, Auto Komen memakai akun buyer sendiri.
+Layanan promosi Telegram dengan dua pilihan eksekutor: Userbot Promosi memakai akun buyer untuk Auto Sebar dan Auto Komen MF, sedangkan Auto Sebar Akun Admin memakai worker milik admin secara 1:1 per buyer dan tidak memiliki akses Auto Komen.
 
 ## Yang sudah dibangun
 
 - Dashboard buyer dan panel admin setup buyer.
-- Inventory worker: tambah, assign, nonaktifkan/hapus record, maksimal 15 grup per buyer.
+- Inventory worker: tambah, login/login ulang, assign, pantau health runner, nonaktifkan, putuskan session, dan hapus record.
+- Pergantian worker memakai proses draining: akun lama menyelesaikan leave sebelum kembali tersedia, sementara akun baru menyiapkan target buyer.
 - Konfigurasi Auto Sebar dan Auto Komen berbasis approval atau otomatis.
 - Retensi siap dijalankan: kandidat approval 48 jam, anti-duplikat 7 hari, riwayat sebar 30 hari / 100 terakhir.
-- Paket Promosi tunggal: buyer memilih masa aktif dan kapasitas LPM sekali, lalu Auto Sebar dan Auto Komen MF aktif bersamaan.
-- Pembayaran Pakasir: buyer diarahkan ke halaman pembayaran Pakasir, lalu kedua akses paket aktif hanya setelah webhook diverifikasi ulang ke Transaction Detail API.
+- Paket terpisah untuk Auto Sebar Akun Admin dan Userbot Promosi; masa aktif serta kapasitas LPM mengikuti paket yang dipilih.
+- Pembayaran Pakasir: buyer diarahkan ke halaman pembayaran, lalu produk yang dibeli aktif hanya setelah webhook diverifikasi ulang ke Transaction Detail API.
 
 ## Menjalankan
 

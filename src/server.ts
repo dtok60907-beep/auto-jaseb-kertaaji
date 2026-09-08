@@ -12,12 +12,14 @@ import { Api, TelegramClient, password as telegramPassword } from "teleproto";
 import { StringSession } from "teleproto/sessions/index.js";
 import { loadBuyerState, loadPersistentStore, readEncryptedSessions, removeEncryptedSession, saveBuyerState, saveEncryptedSession, savePersistentStore } from "./database.js";
 import { buyerWithEffectiveAccess, clearManualPlanAccess, extendedEndsAt, hasPlanAccess, productPlans, reconcileManualPlanFlags, retainUserbotSession, shouldCancelCommentWork, shouldNotifyExpiry, type Plan } from "./access.js";
+import { splitTargetInput } from "./target-input.js";
+import { effectiveWorkerAccountStatus, syncManagedLpmTargets, workerCanBeAssigned, workerHasPendingTargets, type WorkerAccountStatus } from "./worker-state.js";
 
 type Product = "ADMIN_BROADCAST" | "USERBOT_PROMO" | "LEGACY_BUNDLE";
 type Executor = "ADMIN" | "BUYER";
 type UserbotAccountStatus = "DISCONNECTED" | "CONNECTING" | "CONNECTED" | "RECONNECT_REQUIRED";
 type Buyer = { id: string; name: string; telegramId: string; broadcastActive: boolean; userBroadcastActive?: boolean; commentActive: boolean; commentAccountConnected: boolean; userbotAccountStatus?: UserbotAccountStatus; userbotAccountIssue?: string; userbotLastSeenAt?: string; planBroadcast: boolean; planUserBroadcast?: boolean; planComment: boolean; legacyBundle?: boolean; workerId: string | null; updatedAt: string; broadcastEditingBy?: CommentActor; broadcastEditingUntil?: string; userBroadcastEditingBy?: CommentActor; userBroadcastEditingUntil?: string };
-type Worker = { id: string; label: string; username: string; status: "AVAILABLE" | "ASSIGNED" | "COOLDOWN" | "DISABLED"; buyerId: string | null; cooldownUntil?: string; createdAt: string };
+type Worker = { id: string; label: string; username: string; status: "AVAILABLE" | "ASSIGNED" | "COOLDOWN" | "DISABLED"; buyerId: string | null; accountStatus?: WorkerAccountStatus; accountIssue?: string; lastSeenAt?: string; cooldownUntil?: string; createdAt: string };
 type ForwardSource = { channel: string; messageId: number; showSource: boolean };
 // Field antrean panas (nextSendAt, kursor, token) TIDAK disimpan di sini —
 // semuanya pindah ke app_buyer_state (RUNTIME:*) dan memori proses supaya
@@ -30,7 +32,7 @@ type CommentActor = "ADMIN" | "BUYER";
 type CommentConfig = { buyerId: string; bases: string[]; divisions: CommentDivision[]; mode: "APPROVAL" | "AUTO"; updatedAt: string; updatedBy: CommentActor; editingBy?: CommentActor; editingUntil?: string };
 type CommentTargetStatus = "CHECKING" | "READY" | "PENDING_APPROVAL" | "UNAVAILABLE" | "MUTED";
 type CommentTarget = { id: string; buyerId: string; base: string; discussion?: string; status: CommentTargetStatus; note?: string; updatedAt: string };
-type Activity = { buyerId: string; kind: "BROADCAST" | "COMMENT"; status: string; label: string; link?: string; at: string };
+type Activity = { buyerId: string; kind: "BROADCAST" | "COMMENT"; executor?: Executor; status: string; label: string; link?: string; at: string };
 type Candidate = { id: string; buyerId: string; base: string; messageId: string; link: string; wording: string; preview: string; createdAt: string };
 type CommentJob = { id: string; buyerId: string; base: string; messageId: string; wording: string; link: string; preview: string; commentMessageId?: string; status: "PENDING" | "SENDING" | "DONE" | "FAILED" | "CANCELED" | "DELETE_PENDING" | "DELETING" | "DELETED" | "DELETE_FAILED"; deliveryToken?: string; deliveryUntil?: string; deleteToken?: string; deleteUntil?: string; createdAt: string };
 type PackageService = Product;
@@ -106,6 +108,10 @@ type PendingCommentLogin = { buyerId: string; phone: string; phoneCodeHash: stri
 const pendingWorkerLogins = new Map<string, PendingWorkerLogin>();
 const pendingCommentLogins = new Map<string, PendingCommentLogin>();
 const workerRunners = new Map<string, ChildProcess>();
+const workerRunnerInstances = new Map<string, string>();
+const expectedWorkerStops = new Set<string>();
+const workerHeartbeatAt = new Map<string, string>();
+const workerRunnerStartedAt = new Map<string, number>();
 let userbotRunner: ChildProcess | undefined;
 const userbotRosterFile = join(root, "../data/userbot-roster.json");
 let userbotRosterText = "";
@@ -121,6 +127,7 @@ let runnerReconcileRequested = false;
 const runnerRestartNotBefore = new Map<string, number>();
 const RUNNER_CRASH_COOLDOWN_MS = 90_000;
 const RUNNER_DUPLICATED_COOLDOWN_MS = 5 * 60_000;
+const WORKER_HEARTBEAT_STALE_MS = 2 * 60_000;
 
 function workerSessionKey() { const secret = process.env.WORKER_SESSION_KEY ?? ""; if (secret.length < 24) throw new Error("Konfigurasi session worker belum siap."); return createHash("sha256").update(secret).digest(); }
 function encryptWorkerSession(value: string) { const iv = randomBytes(12); const cipher = createCipheriv("aes-256-gcm", workerSessionKey(), iv); const encrypted = Buffer.concat([cipher.update(value, "utf8"), cipher.final()]); return [iv.toString("base64url"), cipher.getAuthTag().toString("base64url"), encrypted.toString("base64url")].join("."); }
@@ -180,8 +187,51 @@ function removeRunnerPid(pid: number | undefined) {
 // pemakaian memori melonjak sekaligus dan memicu OOM di kontainer kecil.
 function scheduleStaggeredStarts(starts: (() => void)[], gapMs = 4_000) { starts.forEach((start, index) => { const timer = setTimeout(() => { if (!shuttingDown) start(); }, index * gapMs); timer.unref(); }); }
 function terminateRunner(runner: ChildProcess | undefined) { if (!runner || runner.exitCode !== null) return; try { if (runner.pid) process.kill(-runner.pid, "SIGTERM"); else runner.kill(); } catch { runner.kill(); } }
-function startWorkerRunner(workerId: string) { if (shuttingDown || workerRunners.get(workerId)?.exitCode === null) return; if (Date.now() < (runnerRestartNotBefore.get("worker:" + workerId) ?? 0)) return; const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/lpm-runner.ts"), workerId], { cwd: join(root, ".."), env: process.env, stdio: "ignore", detached: true }); workerRunners.set(workerId, runner); appendRunnerPid({ pid: runner.pid!, host: bootHostname, workerId }); runner.on("exit", () => { removeRunnerPid(runner.pid); workerRunners.delete(workerId); scheduleRunnerReconcile(); }); runner.unref(); }
-function stopWorkerRunner(workerId: string) { terminateRunner(workerRunners.get(workerId)); workerRunners.delete(workerId); }
+function startWorkerRunner(workerId: string) {
+  if (shuttingDown || workerRunners.get(workerId)?.exitCode === null) return;
+  if (Date.now() < (runnerRestartNotBefore.get("worker:" + workerId) ?? 0)) return;
+  const instanceId = id("runner");
+  const runner = spawn(process.execPath, [join(root, "../node_modules/tsx/dist/cli.mjs"), join(root, "../scripts/lpm-runner.ts"), workerId], { cwd: join(root, ".."), env: { ...process.env, WORKER_RUNNER_INSTANCE: instanceId }, stdio: ["ignore", "pipe", "pipe"], detached: true });
+  let stderr = ""; let stdoutTail = "";
+  expectedWorkerStops.delete(workerId); workerRunners.set(workerId, runner); workerRunnerInstances.set(workerId, instanceId); workerRunnerStartedAt.set(workerId, Date.now()); appendRunnerPid({ pid: runner.pid!, host: bootHostname, workerId });
+  runner.stderr?.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-1_200); });
+  runner.stdout?.on("data", (chunk: Buffer) => {
+    stdoutTail = (stdoutTail + chunk.toString()).slice(-4_000); const lines = stdoutTail.split("\n"); stdoutTail = lines.pop() ?? "";
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const message = JSON.parse(line) as { event?: string; workerId?: string; error?: string };
+        if (message.event === "worker-connected") { workerHeartbeatAt.set(workerId, now()); app.log.info({ workerId }, "🟢 Akun worker tersambung"); }
+        else if (message.event === "worker-heartbeat") workerHeartbeatAt.set(workerId, now());
+        else if (message.event === "worker-reconnect-required") app.log.warn({ workerId, error: message.error ?? null }, "💀 Session akun worker perlu dihubungkan ulang");
+        else if (message.event === "worker-stopped") app.log.info({ workerId }, "🛑 Runner akun worker berhenti");
+        else if (message.event === "worker-poll-error") app.log.warn({ workerId, error: message.error ?? null }, "Polling akun worker mengalami gangguan");
+        else app.log.info({ workerId, raw: line.slice(0, 220) }, "Pesan runner akun worker");
+      } catch { app.log.warn({ workerId, raw: line.slice(0, 220) }, "Baris tak terbaca dari runner akun worker"); }
+    }
+  });
+  runner.on("error", (error) => app.log.error({ err: error, workerId }, "Runner akun worker tidak dapat dimulai"));
+  runner.on("exit", (code, signal) => {
+    removeRunnerPid(runner.pid); if (workerRunners.get(workerId) === runner) { workerRunners.delete(workerId); if (workerRunnerInstances.get(workerId) === instanceId) workerRunnerInstances.delete(workerId); } workerHeartbeatAt.delete(workerId); workerRunnerStartedAt.delete(workerId);
+    const expected = expectedWorkerStops.delete(workerId) || shuttingDown;
+    if (!expected) {
+      const detail = stderr.trim().slice(-400) || `Runner berhenti (${code ?? signal ?? "unknown"}).`;
+      const sessionDead = sessionErrorPattern.test(detail); const duplicated = /AUTH_KEY_DUPLICATED/i.test(detail); const cooldown = duplicated ? RUNNER_DUPLICATED_COOLDOWN_MS : RUNNER_CRASH_COOLDOWN_MS;
+      if (!sessionDead) runnerRestartNotBefore.set("worker:" + workerId, Date.now() + cooldown);
+      void withStoreLock(() => updateWorkerAccountState(workerId, sessionDead ? "RECONNECT_REQUIRED" : "CONNECTING", detail, sessionDead ? undefined : new Date(Date.now() + cooldown).toISOString())).catch((error) => app.log.warn({ err: error, workerId }, "Status akun worker gagal diperbarui setelah runner berhenti"));
+      app.log.warn({ workerId, code, signal, reconnectRequired: sessionDead, backoffMs: sessionDead ? null : cooldown, stderr: detail }, sessionDead ? "Runner worker berhenti karena session mati" : "Runner worker berhenti; dinyalakan ulang setelah backoff");
+      if (!sessionDead) scheduleRunnerReconcile(cooldown + 5_000);
+    }
+    scheduleRunnerReconcile();
+  });
+  runner.unref();
+}
+function stopWorkerRunner(workerId: string) {
+  const runner = workerRunners.get(workerId); workerRunnerInstances.delete(workerId);
+  if (!runner || runner.exitCode !== null) { workerRunners.delete(workerId); return; }
+  expectedWorkerStops.add(workerId); terminateRunner(runner);
+  const forceStop = setTimeout(() => { if (workerRunners.get(workerId) === runner && runner.exitCode === null && runner.pid) { app.log.warn({ workerId, pid: runner.pid }, "Runner worker tidak berhenti setelah SIGTERM; dikirim SIGKILL"); killStaleRunner(runner.pid); } }, 5_000); forceStop.unref();
+}
 function writeUserbotRoster(buyerIds: string[]) {
   const text = JSON.stringify(buyerIds.sort());
   userbotRosterSize = buyerIds.length;
@@ -302,7 +352,7 @@ async function load(): Promise<Store> {
     const oldPlans = ready.subscriptions.filter((item) => item.buyerId === buyer.id && !item.product);
     if (oldPlans.some((item) => item.plan === "BROADCAST") && oldPlans.some((item) => item.plan === "COMMENT")) buyer.legacyBundle = true;
   }
-  for (const worker of ready.workers) if (worker.status === "COOLDOWN") { worker.status = "AVAILABLE"; worker.buyerId = null; delete worker.cooldownUntil; }
+  for (const worker of ready.workers) if (worker.status === "COOLDOWN" && (!worker.cooldownUntil || Date.parse(worker.cooldownUntil) <= Date.now())) { worker.status = worker.buyerId ? "ASSIGNED" : "AVAILABLE"; delete worker.cooldownUntil; }
   for (const broadcast of ready.broadcasts.filter((item) => broadcastExecutor(item) === "ADMIN")) {
     const buyer = ready.buyers.find((item) => item.id === broadcast.buyerId);
     if (!buyer?.workerId || ready.lpmTargets.some((item) => item.buyerId === broadcast.buyerId && targetExecutor(item) === "ADMIN")) continue;
@@ -347,37 +397,27 @@ function buyerForRequest(store: Store, req: any) {
     ?? (process.env.ALLOW_DEMO === "true" ? store.buyers.find((item) => item.id === "buyer-demo") : undefined);
 }
 function cleanGroups(value: unknown, maxGroups = Number.POSITIVE_INFINITY): string[] {
-  const raw = Array.isArray(value) ? value : [];
+  const raw = splitTargetInput(value);
   const groups = raw.map((item) => String(item).trim().replace(/^@/, "")).filter((item) => /^[A-Za-z][A-Za-z0-9_]{3,}$/.test(item));
   if (!groups.length || new Set(groups.map((item) => item.toLowerCase())).size !== groups.length) throw new Error("Masukkan grup publik unik ber-username.");
   if (groups.length > maxGroups) throw new Error(`Paket buyer ini mendukung hingga ${maxGroups} grup LPM.`);
   return groups;
 }
+function assignWorkerToBroadcast(store: Store, buyer: Buyer, worker: Worker, groups: string[]) {
+  const previousWorkerId = buyer.workerId;
+  if (previousWorkerId && previousWorkerId !== worker.id) activeDeliveries.delete(runtimeKey(buyer.id, "ADMIN"));
+  worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
+  syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
+  if (previousWorkerId && previousWorkerId !== worker.id) releaseWorkerByIdWhenGroupsCleared(store, previousWorkerId);
+}
 function targetExecutor(target: LpmTarget): Executor { return target.executor === "BUYER" ? "BUYER" : "ADMIN"; }
 function broadcastExecutor(broadcast: Broadcast): Executor { return broadcast.executor === "BUYER" ? "BUYER" : "ADMIN"; }
 function broadcastFor(store: Store, buyerId: string, executor: Executor) { return store.broadcasts.find((item) => item.buyerId === buyerId && broadcastExecutor(item) === executor); }
 function syncLpmTargets(store: Store, buyer: Buyer, executorId: string, executor: Executor, groups: string[]) {
-  const wanted = new Set(groups.map((item) => item.toLowerCase()));
-  const current = store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === executor && item.desired);
-  for (const target of current) if (!wanted.has(target.username.toLowerCase())) { target.desired = false; target.status = "REMOVING"; target.note = undefined; target.updatedAt = now(); }
-  for (const username of groups) {
-    const existing = store.lpmTargets.find((item) => item.buyerId === buyer.id && targetExecutor(item) === executor && item.username.toLowerCase() === username.toLowerCase());
-    if (existing) {
-      const workerChanged = existing.workerId !== executorId;
-      existing.desired = true; existing.workerId = executorId; existing.executor = executor;
-      // PENDING_APPROVAL ikut di-reset: permintaan join bisa saja tidak pernah
-      // disetujui admin grup, dan simpan ulang setup adalah satu-satunya cara
-      // buyer menyatakan "coba masuk lagi". Telegram menjawab INVITE_REQUEST_SENT
-      // lagi bila permintaan lama masih menggantung, jadi tidak ada spam.
-      if (workerChanged || existing.status === "REMOVING" || existing.status === "REMOVED" || existing.status === "READY" || existing.status === "UNAVAILABLE" || existing.status === "PENDING_APPROVAL") { existing.status = "CONNECTING"; existing.note = undefined; }
-      existing.updatedAt = now();
-      continue;
-    }
-    store.lpmTargets.push({ id: id("lpm"), buyerId: buyer.id, workerId: executorId, executor, username, status: "CONNECTING", desired: true, createdAt: now(), updatedAt: now() });
-  }
+  syncManagedLpmTargets(store.lpmTargets, buyer.id, executorId, executor, groups, now(), () => id("lpm"));
 }
 function publicLpmTargets(store: Store, buyerId: string, executor?: Executor) { return store.lpmTargets.filter((item) => item.buyerId === buyerId && (!executor || targetExecutor(item) === executor) && (item.desired || item.status === "REMOVING") && item.status !== "REMOVED").sort((a, b) => a.createdAt.localeCompare(b.createdAt)); }
-const sessionErrorPattern = /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|CONCURRENT USAGE|authorization key/i;
+const sessionErrorPattern = /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|CONCURRENT USAGE|authorization key|session worker sudah tidak aktif|login ulang/i;
 function reviveSessionPoisonedLpmTargets(store: Store, buyerId: string) {
   // Dulu error level-session (AUTH_KEY_UNREGISTERED dsb.) sempat mencap grup
   // individual sebagai UNAVAILABLE walau grupnya sebenarnya sehat. Saat akun
@@ -403,7 +443,7 @@ function sendBuyerAlert(store: Store, buyerId: string, title: string, detail: st
 function previewText(value: string) { return value.replace(/\s+/g, " ").trim().slice(0, 900) || "(Post tanpa teks)"; }
 function sendApprovalAlert(store: Store, candidate: Candidate) { const buyer = store.buyers.find((item) => item.id === candidate.buyerId); if (!buyer?.telegramId || !bot) return; const text = [`Lead baru · @${candidate.base}`, "", "Post yang cocok:", candidate.preview, "", "Komentar yang akan dikirim:", candidate.wording, candidate.link ? `Link post MF: ${candidate.link}` : ""].filter(Boolean).join("\n"); const keyboard = new InlineKeyboard().text("✅ Tepat", `cm:g:${candidate.id}`).text("🚫 OOT", `cm:b:${candidate.id}`); void bot.api.sendMessage(buyer.telegramId, text, { reply_markup: keyboard, link_preview_options: { is_disabled: true } }).catch(() => undefined); }
 function sendAutoCommentAlert(store: Store, job: CommentJob) { const buyer = store.buyers.find((item) => item.id === job.buyerId); if (!buyer?.telegramId || !bot) return; const text = [`Komentar otomatis terkirim · @${job.base}`, "", "Post yang cocok:", job.preview, "", "Komentar yang terkirim:", job.wording, job.link ? `Link post MF: ${job.link}` : ""].filter(Boolean).join("\n"); const keyboard = new InlineKeyboard().text("🚫 OOT — hapus komentar", `cm:d:${job.id}`); void bot.api.sendMessage(buyer.telegramId, text, { reply_markup: keyboard, link_preview_options: { is_disabled: true } }).catch(() => undefined); }
-function split(value: unknown): string[] { return String(value ?? "").split(/[\n,]/).map((item) => item.trim()).filter(Boolean).slice(0, 60); }
+function split(value: unknown): string[] { return splitTargetInput(value).slice(0, 60); }
 function cleanDivisions(value: unknown): CommentDivision[] { const raw = Array.isArray(value) ? value : []; const divisions = raw.map((item: any) => ({ id: String(item?.id ?? id("division")), name: String(item?.name ?? "").trim().slice(0, 50), keywords: Array.isArray(item?.keywords) ? item.keywords.map(String).map((word: string) => word.trim()).filter(Boolean).slice(0, 60) : split(item?.keywords), blacklist: Array.isArray(item?.blacklist) ? item.blacklist.map(String).map((word: string) => word.trim()).filter(Boolean).slice(0, 60) : split(item?.blacklist), wording: String(item?.wording ?? "").trim().slice(0, 4000) })).filter((item) => item.name && item.keywords.length && item.wording); if (!divisions.length) throw new Error("Setidaknya isi satu divisi, keyword, dan wording."); return divisions; }
 const invisibleChars = /[​‌‍­﻿⁠]/g;
 function normalizeMatch(value: string) { return value.replace(invisibleChars, "").replace(/\s+/g, " ").toLowerCase().trim(); }
@@ -541,15 +581,33 @@ function maxGroupsForBuyer(store: Store, buyer: Buyer, plan: "BROADCAST" | "USER
 }
 function releaseWorker(store: Store, buyer: Buyer) {
   if (!buyer.workerId) return;
-  const worker = store.workers.find((item) => item.id === buyer.workerId);
-  if (worker) {
-    worker.buyerId = null; worker.status = "AVAILABLE"; delete worker.cooldownUntil;
-  }
-  buyer.workerId = null;
+  releaseWorkerByIdWhenGroupsCleared(store, buyer.workerId);
 }
 function releaseWorkerWhenGroupsCleared(store: Store, buyer: Buyer) {
-  const stillLeaving = store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.status !== "REMOVED");
-  if (!stillLeaving) releaseWorker(store, buyer);
+  if (buyer.workerId) releaseWorkerByIdWhenGroupsCleared(store, buyer.workerId);
+}
+function releaseWorkerByIdWhenGroupsCleared(store: Store, workerId: string) {
+  if (workerHasPendingTargets(store.lpmTargets, workerId)) return;
+  const worker = store.workers.find((item) => item.id === workerId);
+  if (worker) { worker.buyerId = null; if (worker.status !== "DISABLED") worker.status = "AVAILABLE"; delete worker.cooldownUntil; }
+  for (const buyer of store.buyers) if (buyer.workerId === workerId) buyer.workerId = null;
+}
+async function updateWorkerAccountState(workerId: string, accountStatus: WorkerAccountStatus, issue?: string, cooldownUntil?: string) {
+  const store = await load(); const worker = store.workers.find((item) => item.id === workerId);
+  if (!worker) return;
+  const timestamp = now(); worker.accountStatus = accountStatus; worker.lastSeenAt = timestamp;
+  if (issue) worker.accountIssue = issue.slice(0, 220); else delete worker.accountIssue;
+  if (cooldownUntil) worker.cooldownUntil = cooldownUntil; else if (accountStatus === "CONNECTED" || accountStatus === "RECONNECT_REQUIRED") delete worker.cooldownUntil;
+  if (accountStatus === "CONNECTED") {
+    runnerRestartNotBefore.delete("worker:" + workerId);
+    for (const target of store.lpmTargets) if (target.workerId === workerId && targetExecutor(target) === "ADMIN" && target.desired && target.status === "UNAVAILABLE" && sessionErrorPattern.test(target.note ?? "")) { target.status = "CONNECTING"; delete target.note; target.updatedAt = timestamp; }
+  }
+  if (accountStatus === "RECONNECT_REQUIRED" && worker.buyerId) activeDeliveries.delete(runtimeKey(worker.buyerId, "ADMIN"));
+  await save(store);
+  if (accountStatus === "CONNECTED" && worker.buyerId) {
+    const buyer = store.buyers.find((item) => item.id === worker.buyerId); const broadcast = buyer ? broadcastFor(store, buyer.id, "ADMIN") : undefined;
+    if (buyer?.broadcastActive && broadcast) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
+  }
 }
 function cleanup(store: Store) {
   // Deteksi perubahan pakai flag eksplisit, BUKAN membandingkan dua hasil
@@ -612,18 +670,32 @@ function cleanup(store: Store) {
 async function reconcileRunners() {
   if (shuttingDown) return;
   await withStoreLock(async () => {
-    const store = await load(); cleanup(store); await save(store);
+    const store = await load(); cleanup(store);
     const delayedStarts: (() => void)[] = [];
     const workerSessions = await readWorkerSessions();
-    for (const workerId of Object.keys(workerSessions)) {
-      const worker = store.workers.find((item) => item.id === workerId);
+    const sessionIds = new Set(Object.keys(workerSessions));
+    for (const worker of store.workers) {
+      const hasSession = sessionIds.has(worker.id);
+      const effective = effectiveWorkerAccountStatus(worker, hasSession);
+      if (worker.accountStatus !== effective) worker.accountStatus = effective;
+      if (!hasSession) {
+        stopWorkerRunner(worker.id); worker.accountStatus = "DISCONNECTED";
+        if (!pendingWorkerLogins.has(worker.id)) worker.accountIssue = "Session Telegram belum terhubung.";
+        continue;
+      }
       // Worker tanpa pemilik (AVAILABLE) tidak dispawn: satu proses GramJS
       // nganggur makan ±100MB RAM terus-menerus padahal tidak mengerjakan apa pun.
       // Session-nya tetap disimpan, jadi begitu di-assign ke buyer reconcile
       // otomatis menyalakan runner-nya.
-      if (worker && worker.status !== "DISABLED") { if (worker.buyerId) delayedStarts.push(() => startWorkerRunner(workerId)); else stopWorkerRunner(workerId); }
-      else { stopWorkerRunner(workerId); await removeWorkerSession(workerId); }
+      if (worker.status === "DISABLED" || worker.accountStatus === "RECONNECT_REQUIRED") stopWorkerRunner(worker.id);
+      else if (worker.buyerId) {
+        const runnerAlive = workerRunners.get(worker.id)?.exitCode === null; const observedAt = Date.parse(workerHeartbeatAt.get(worker.id) ?? "") || workerRunnerStartedAt.get(worker.id) || Date.now();
+        if (runnerAlive && Date.now() - observedAt > WORKER_HEARTBEAT_STALE_MS) {
+          const retryAt = new Date(Date.now() + RUNNER_CRASH_COOLDOWN_MS).toISOString(); worker.accountStatus = "CONNECTING"; worker.accountIssue = "Heartbeat runner terhenti. Sistem menjadwalkan koneksi ulang."; worker.cooldownUntil = retryAt; runnerRestartNotBefore.set("worker:" + worker.id, Date.parse(retryAt)); stopWorkerRunner(worker.id); scheduleRunnerReconcile(RUNNER_CRASH_COOLDOWN_MS + 5_000); app.log.warn({ workerId: worker.id }, "Heartbeat worker terhenti; runner dimulai ulang setelah backoff");
+        } else delayedStarts.push(() => startWorkerRunner(worker.id));
+      } else stopWorkerRunner(worker.id);
     }
+    for (const workerId of sessionIds) if (!store.workers.some((item) => item.id === workerId)) { stopWorkerRunner(workerId); await removeWorkerSession(workerId); }
     const commentSessions = await readCommentSessions();
     const activeUserbotBuyers: string[] = [];
     for (const buyerId of Object.keys(commentSessions)) {
@@ -679,13 +751,15 @@ app.get("/api/buyer/dashboard", async (req, reply) => {
   }
   if (changed) await save(store);
   if (!buyer) return { onboarding: true, buyer: null, subscriptionsOpen: selfServiceSubscriptionsEnabled, worker: null, broadcast: null, userBroadcast: null, lpmTargets: [], userLpmTargets: [], commentTargets: [], comment: null, activity: [] };
+  const assignedWorker = buyer.workerId ? store.workers.find((item) => item.id === buyer.workerId) : undefined; const workerSessions = assignedWorker ? await readWorkerSessions() : {};
+  const publicWorker = assignedWorker ? { ...assignedWorker, accountStatus: effectiveWorkerAccountStatus(assignedWorker, Boolean(workerSessions[assignedWorker.id])), sessionReady: Boolean(workerSessions[assignedWorker.id]), runnerActive: workerRunners.get(assignedWorker.id)?.exitCode === null, lastSeenAt: workerHeartbeatAt.get(assignedWorker.id) ?? assignedWorker.lastSeenAt } : null;
   return {
     buyer: buyerWithEffectiveAccess(store, buyer),
     subscriptionsOpen: selfServiceSubscriptionsEnabled,
     entitlements: entitlementSummary(store, buyer),
     broadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),
     userBroadcastQuota: (() => { const quota = maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST"); return Number.isFinite(quota) ? quota : null; })(),
-    worker: buyer.workerId ? store.workers.find((item) => item.id === buyer.workerId) ?? null : null,
+    worker: publicWorker,
     broadcast: (() => { const item = broadcastFor(store, buyer.id, "ADMIN"); return item ? { ...item, maxGroups: maxGroupsForBuyer(store, buyer, "BROADCAST") } : null; })(),
     userBroadcast: (() => { const item = broadcastFor(store, buyer.id, "BUYER"); return item ? { ...item, maxGroups: maxGroupsForBuyer(store, buyer, "USERBOT_BROADCAST") } : null; })(),
     lpmTargets: publicLpmTargets(store, buyer.id, "ADMIN"),
@@ -786,8 +860,10 @@ app.post<{ Body: { feature: "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT"; activ
   if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Layanan belum disiapkan untuk akun Telegram ini." });
   const feature = req.body.feature;
   if (feature === "BROADCAST") {
-    const ready = hasPlanAccess(store, buyer, "BROADCAST") && buyer.workerId && Boolean(broadcastFor(store, buyer.id, "ADMIN")) && store.lpmTargets.some((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired && item.status === "READY");
-    if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: "Belum ada grup yang siap dipakai." });
+    const sessions = req.body.active ? await readWorkerSessions() : {}; const worker = buyer.workerId ? store.workers.find((item) => item.id === buyer.workerId) : undefined;
+    const workerReady = Boolean(worker && workerCanBeAssigned(worker, Boolean(sessions[worker.id]), buyer.id));
+    const ready = hasPlanAccess(store, buyer, "BROADCAST") && workerReady && Boolean(broadcastFor(store, buyer.id, "ADMIN")) && store.lpmTargets.some((item) => item.buyerId === buyer.id && item.workerId === buyer.workerId && targetExecutor(item) === "ADMIN" && item.desired && item.status === "READY");
+    if (req.body.active && !ready) return reply.code(409).send({ error: "setup_incomplete", reason: !workerReady ? "Akun admin belum siap. Hubungi admin." : "Belum ada grup yang siap dipakai." });
     buyer.broadcastActive = req.body.active;
     if (req.body.active) await scheduleNextSend(buyer.id, "ADMIN", broadcastFor(store, buyer.id, "ADMIN")?.intervalMinutes ?? 15, true);
     else await clearSendSchedule(buyer.id, "ADMIN");
@@ -812,22 +888,21 @@ app.post<{ Body: { feature: "BROADCAST" | "USERBOT_BROADCAST" | "COMMENT"; activ
   return { ok: true, buyer };
 });
 
-app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number } }>("/api/buyer/broadcast-setup", async (req, reply) => {
+app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[] | string; intervalMinutes?: number } }>("/api/buyer/broadcast-setup", async (req, reply) => {
   const store = await load(); cleanup(store); const buyer = buyerForRequest(store, req);
   if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Akun buyer belum ditemukan." });
   if (!hasPlanAccess(store, buyer, "BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Langganan Auto Sebar belum aktif." });
   let content: ReturnType<typeof broadcastContent>; try { content = broadcastContent(req.body ?? {}); } catch (error) { return reply.code(400).send({ error: "wording_invalid", reason: (error as Error).message }); }
   let groups: string[]; try { groups = cleanGroups(req.body?.groups, maxGroupsForBuyer(store, buyer)); } catch (error) { return reply.code(400).send({ error: "groups_invalid", reason: (error as Error).message }); }
-  let worker = buyer.workerId ? store.workers.find((item) => item.id === buyer.workerId) : undefined;
-  if (!worker) worker = store.workers.find((item) => item.status === "AVAILABLE");
-  if (!worker) return reply.code(409).send({ error: "worker_unavailable", reason: "Akun kerja belum tersedia. Hubungi admin." });
-  if (worker.status !== "AVAILABLE" && worker.buyerId !== buyer.id) return reply.code(409).send({ error: "worker_unavailable", reason: "Akun kerja belum tersedia. Hubungi admin." });
-  for (const item of store.workers) if (item.buyerId === buyer.id && item.id !== worker.id) { item.buyerId = null; item.status = "AVAILABLE"; }
-  worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
-  syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
+  const workerSessions = await readWorkerSessions(); let worker = buyer.workerId ? store.workers.find((item) => item.id === buyer.workerId) : undefined;
+  if (worker && !workerCanBeAssigned(worker, Boolean(workerSessions[worker.id]), buyer.id)) return reply.code(409).send({ error: "worker_reconnect_required", reason: "Akun admin sedang bermasalah. Admin perlu menghubungkannya ulang atau mengganti akun." });
+  if (!worker) worker = store.workers.find((item) => workerCanBeAssigned(item, Boolean(workerSessions[item.id])));
+  if (!worker) return reply.code(409).send({ error: "worker_unavailable", reason: "Akun admin yang siap belum tersedia. Hubungi admin." });
+  assignWorkerToBroadcast(store, buyer, worker, groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body?.intervalMinutes), updatedBy: "BUYER", updatedAt: now() };
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; buyer.updatedAt = now(); await save(store);
   if (buyer.broadcastActive) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
+  void reconcileRunnersSafely();
   return { ok: true, broadcast };
 });
 
@@ -843,7 +918,7 @@ app.post("/api/buyer/userbot-broadcast/edit", async (req, reply) => {
 app.post("/api/buyer/userbot-broadcast/cancel", async (req, reply) => {
   const store = await load(); const buyer = buyerForRequest(store, req); if (buyer) unlockUserBroadcast(buyer, "BUYER"); await save(store); return { ok: true };
 });
-app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number } }>("/api/buyer/userbot-broadcast-setup", async (req, reply) => {
+app.put<{ Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[] | string; intervalMinutes?: number } }>("/api/buyer/userbot-broadcast-setup", async (req, reply) => {
   const store = await load(); cleanup(store); const buyer = buyerForRequest(store, req);
   if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Akun buyer belum ditemukan." });
   if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
@@ -874,7 +949,7 @@ app.post<{ Params: { id: string } }>("/api/admin/buyers/:id/userbot-broadcast-co
 app.post<{ Params: { id: string } }>("/api/admin/buyers/:id/userbot-broadcast-config/cancel", { preHandler: adminOnly }, async (req) => {
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id); if (buyer) unlockUserBroadcast(buyer, "ADMIN"); await save(store); return { ok: true };
 });
-app.put<{ Params: { id: string }; Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number } }>("/api/admin/buyers/:id/userbot-broadcast-config", { preHandler: adminOnly }, async (req, reply) => {
+app.put<{ Params: { id: string }; Body: { mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[] | string; intervalMinutes?: number } }>("/api/admin/buyers/:id/userbot-broadcast-config", { preHandler: adminOnly }, async (req, reply) => {
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!buyer) return reply.code(404).send({ error: "buyer_not_found", reason: "Buyer tidak ditemukan." });
   if (!hasPlanAccess(store, buyer, "USERBOT_BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
@@ -914,9 +989,20 @@ async function lpmAdapterOnly(req: any, reply: any) {
   const token = process.env.LPM_ADAPTER_TOKEN;
   if (!token || req.headers["x-lpm-adapter-token"] !== token) return reply.code(403).send({ error: "adapter_only" });
 }
+function workerRunnerAuthorized(req: any, workerId: string) { const instanceId = String(req.headers["x-worker-runner-instance"] ?? ""); return Boolean(instanceId && workerRunnerInstances.get(workerId) === instanceId); }
+app.post<{ Body: { workerId?: string; instanceId?: string; status?: "CONNECTED" | "HEARTBEAT" | "RECONNECT_REQUIRED"; issue?: string } }>("/api/internal/worker-account-status", { preHandler: lpmAdapterOnly }, async (req, reply) => {
+  const workerId = String(req.body?.workerId ?? ""); const instanceId = String(req.body?.instanceId ?? ""); const status = req.body?.status;
+  if (!workerId || !status || !["CONNECTED", "HEARTBEAT", "RECONNECT_REQUIRED"].includes(status)) return reply.code(400).send({ error: "worker_status_invalid" });
+  if (!instanceId || workerRunnerInstances.get(workerId) !== instanceId) return reply.code(409).send({ error: "worker_runner_replaced" });
+  workerHeartbeatAt.set(workerId, now());
+  if (status === "HEARTBEAT") return { ok: true };
+  await updateWorkerAccountState(workerId, status, String(req.body?.issue ?? "").trim() || undefined);
+  return { ok: true };
+});
 app.get<{ Querystring: { workerId?: string } }>("/api/internal/lpm-jobs", { preHandler: lpmAdapterOnly }, async (req) => {
-  const workerId = String(req.query.workerId ?? ""); const store = await load();
-  return { jobs: store.lpmTargets.filter((item) => item.workerId === workerId && ((item.desired && item.status === "CONNECTING") || (!item.desired && item.status === "REMOVING"))).map((item) => ({ id: item.id, action: item.desired ? "JOIN" : "LEAVE", username: item.username })) };
+  const workerId = String(req.query.workerId ?? ""); const store = await load(); const worker = store.workers.find((item) => item.id === workerId);
+  const adminReady = Boolean(worker && workerRunnerAuthorized(req, workerId) && worker.accountStatus === "CONNECTED" && worker.status !== "DISABLED" && worker.buyerId);
+  return { jobs: store.lpmTargets.filter((item) => item.workerId === workerId && (targetExecutor(item) === "BUYER" || adminReady) && ((item.desired && item.status === "CONNECTING") || (!item.desired && item.status === "REMOVING"))).map((item) => ({ id: item.id, action: item.desired ? "JOIN" : "LEAVE", username: item.username })) };
 });
 app.get<{ Querystring: { buyerId?: string } }>("/api/internal/userbot-lpm-monitor", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const buyerId = String(req.query.buyerId ?? ""); const store = await load(); const buyer = store.buyers.find((item) => item.id === buyerId);
@@ -925,19 +1011,21 @@ app.get<{ Querystring: { buyerId?: string } }>("/api/internal/userbot-lpm-monito
 });
 app.post<{ Params: { id: string }; Body: { workerId?: string; action?: "JOIN" | "LEAVE" } }>("/api/internal/lpm-targets/:id/confirm", { preHandler: lpmAdapterOnly }, async (req) => {
   const store = await load(); const target = store.lpmTargets.find((item) => item.id === req.params.id); const workerId = String(req.body?.workerId ?? ""); const action = req.body?.action;
-  return { execute: Boolean(target && target.workerId === workerId && ((action === "JOIN" && target.desired && target.status === "CONNECTING") || (action === "LEAVE" && !target.desired && target.status === "REMOVING"))) };
+  const worker = target && targetExecutor(target) === "ADMIN" ? store.workers.find((item) => item.id === workerId) : undefined; const executorReady = !target || targetExecutor(target) === "BUYER" || Boolean(worker && workerRunnerAuthorized(req, workerId) && worker.accountStatus === "CONNECTED" && worker.status !== "DISABLED");
+  return { execute: Boolean(target && executorReady && target.workerId === workerId && ((action === "JOIN" && target.desired && target.status === "CONNECTING") || (action === "LEAVE" && !target.desired && target.status === "REMOVING"))) };
 });
 app.post<{ Params: { id: string }; Body: { workerId?: string; status?: LpmTargetStatus; note?: string } }>("/api/internal/lpm-targets/:id/result", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const next = req.body?.status; const allowed: LpmTargetStatus[] = ["PENDING_APPROVAL", "READY", "UNAVAILABLE", "REMOVED"];
   if (!next || !allowed.includes(next)) return reply.code(400).send({ error: "status_invalid" });
   const store = await load(); const target = store.lpmTargets.find((item) => item.id === req.params.id); if (!target) return reply.code(404).send({ error: "target_not_found" });
-  const workerId = String(req.body?.workerId ?? ""); const isCurrent = target.workerId === workerId && ((next === "REMOVED" && !target.desired && target.status === "REMOVING") || (next !== "REMOVED" && target.desired && target.status === "CONNECTING"));
+  const workerId = String(req.body?.workerId ?? ""); if (targetExecutor(target) === "ADMIN" && !workerRunnerAuthorized(req, workerId)) return reply.code(409).send({ error: "worker_runner_replaced" }); const isCurrent = target.workerId === workerId && ((next === "REMOVED" && !target.desired && target.status === "REMOVING") || (next !== "REMOVED" && target.desired && target.status === "CONNECTING"));
   if (!isCurrent) return { ok: true, ignored: true };
-  target.status = next; target.note = String(req.body?.note ?? "").trim().slice(0, 160) || undefined; target.updatedAt = now(); if (next === "REMOVED") { target.desired = false; const buyer = store.buyers.find((item) => item.id === target.buyerId); if (buyer && !buyer.planBroadcast) releaseWorkerWhenGroupsCleared(store, buyer); } await save(store); notifyLpmStatus(store, target); return { ok: true };
+  target.status = next; target.note = String(req.body?.note ?? "").trim().slice(0, 160) || undefined; target.updatedAt = now(); const adminRemoved = next === "REMOVED" && targetExecutor(target) === "ADMIN"; if (next === "REMOVED") { target.desired = false; if (adminRemoved) releaseWorkerByIdWhenGroupsCleared(store, target.workerId); } await save(store); if (adminRemoved) void reconcileRunnersSafely(); notifyLpmStatus(store, target); return { ok: true };
 });
 
 app.get<{ Querystring: { workerId?: string } }>("/api/internal/broadcast-jobs", { preHandler: lpmAdapterOnly }, async (req) => {
   const workerId = String(req.query.workerId ?? ""); const store = await load(); cleanup(store);
+  const worker = store.workers.find((item) => item.id === workerId); if (!worker || !workerRunnerAuthorized(req, workerId) || worker.status === "DISABLED" || worker.accountStatus !== "CONNECTED" || !worker.buyerId) return { jobs: [] };
   const jobs: { buyerId: string; deliveryToken: string; group: string; wording: string; mode: Broadcast["mode"]; forward?: ForwardSource }[] = [];
   for (const broadcast of store.broadcasts) {
     if (broadcastExecutor(broadcast) !== "ADMIN") continue;
@@ -961,16 +1049,21 @@ app.get<{ Querystring: { workerId?: string } }>("/api/internal/broadcast-jobs", 
 
 app.post<{ Params: { id: string }; Body: { deliveryToken?: string; workerId?: string; group?: string } }>("/api/internal/broadcast-jobs/:id/confirm", { preHandler: lpmAdapterOnly }, async (req) => {
   const store = await load(); cleanup(store); const broadcast = broadcastFor(store, req.params.id, "ADMIN"); const buyer = store.buyers.find((item) => item.id === req.params.id); const workerId = String(req.body?.workerId ?? ""); const group = String(req.body?.group ?? "").replace(/^@/, "").toLowerCase();
+  const worker = store.workers.find((item) => item.id === workerId); const workerReady = Boolean(worker && workerRunnerAuthorized(req, workerId) && worker.accountStatus === "CONNECTED" && worker.status !== "DISABLED" && worker.buyerId === buyer?.id);
   const targetReady = Boolean(buyer && store.lpmTargets.some((item) => item.buyerId === buyer.id && item.workerId === workerId && item.desired && item.status === "READY" && item.username.toLowerCase() === group));
   const tokenOk = deliveryMatches(req.params.id, "ADMIN", req.body?.deliveryToken);
-  const allowed = Boolean(broadcast && buyer && tokenOk && buyer.workerId === workerId && buyer.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
-  if (!allowed && tokenOk && broadcast && buyer?.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST")) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
+  const allowed = Boolean(broadcast && buyer && tokenOk && workerReady && buyer.workerId === workerId && buyer.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST") && broadcast.groups.some((item) => item.toLowerCase() === group) && targetReady);
+  // Jadwal tentatif dipasang sebelum Telegram dipanggil. Jika proses mati tepat
+  // setelah kirim tetapi sebelum result diterima, worker pengganti tidak langsung
+  // mengulang materi yang sama dan membuat kiriman ganda.
+  if (allowed && broadcast && buyer) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes);
+  else if (tokenOk && broadcast && buyer?.broadcastActive && hasPlanAccess(store, buyer, "BROADCAST")) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
   return { send: allowed };
 });
 
-app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: string; messageId?: number; error?: string } }>("/api/internal/broadcast-jobs/:id/result", { preHandler: lpmAdapterOnly }, async (req, reply) => {
-  const store = await load(); const broadcast = broadcastFor(store, req.params.id, "ADMIN"); const buyer = store.buyers.find((item) => item.id === req.params.id);
-  if (!broadcast || !buyer || !deliveryMatches(req.params.id, "ADMIN", req.body?.deliveryToken)) return reply.code(409).send({ error: "delivery_not_found" });
+app.post<{ Params: { id: string }; Body: { deliveryToken?: string; workerId?: string; group?: string; messageId?: number; error?: string } }>("/api/internal/broadcast-jobs/:id/result", { preHandler: lpmAdapterOnly }, async (req, reply) => {
+  const store = await load(); const broadcast = broadcastFor(store, req.params.id, "ADMIN"); const buyer = store.buyers.find((item) => item.id === req.params.id); const workerId = String(req.body?.workerId ?? "");
+  if (!broadcast || !buyer || buyer.workerId !== workerId || !workerRunnerAuthorized(req, workerId) || !deliveryMatches(req.params.id, "ADMIN", req.body?.deliveryToken)) return reply.code(409).send({ error: "delivery_not_found" });
   activeDeliveries.delete(runtimeKey(buyer.id, "ADMIN"));
   const group = String(req.body?.group ?? "").replace(/^@/, ""); const failed = String(req.body?.error ?? "").trim(); const messageId = Number(req.body?.messageId);
   await mutateSendRuntime(buyer.id, "ADMIN", (runtime) => {
@@ -979,8 +1072,8 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: strin
     runtime.groupCursor = Math.max(0, Number(runtime.groupCursor) || 0) + 1;
     if (!failed) runtime.lastSentAt = now();
   });
-  if (failed) { req.log.warn({ buyerId: buyer.id, executor: "ADMIN", group, error: failed }, "Kirim broadcast gagal"); await appendActivity(buyer.id, { kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() }); if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.username.toLowerCase() === group.toLowerCase()); if (target) { target.status = "UNAVAILABLE"; target.note = "Akun worker tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun worker tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); } else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain."); else if (/CHANNEL_PRIVATE|MESSAGE_ID_INVALID|MSG_ID_INVALID/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Link forward tidak bisa diakses akun worker. Pastikan post berasal dari channel publik dan link-nya benar."); else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`); }
-  else { const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; await appendActivity(buyer.id, { kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
+  if (failed) { req.log.warn({ buyerId: buyer.id, executor: "ADMIN", group, error: failed }, "Kirim broadcast gagal"); await appendActivity(buyer.id, { kind: "BROADCAST", executor: "ADMIN", status: "failed", label: `Gagal di @${group}`, at: now() }); if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && item.workerId === buyer.workerId && item.username.toLowerCase() === group.toLowerCase()); if (target) { target.status = "UNAVAILABLE"; target.note = "Akun worker tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun worker tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); } else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain."); else if (/CHANNEL_PRIVATE|MESSAGE_ID_INVALID|MSG_ID_INVALID/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Link forward tidak bisa diakses akun worker. Pastikan post berasal dari channel publik dan link-nya benar."); else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`); }
+  else { const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; await appendActivity(buyer.id, { kind: "BROADCAST", executor: "ADMIN", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
   cleanup(store); await save(store); const runtime = await loadSendRuntime(buyer.id, "ADMIN"); return { ok: true, nextSendAt: runtime.nextSendAt };
 });
 
@@ -1022,12 +1115,12 @@ app.post<{ Params: { id: string }; Body: { deliveryToken?: string; group?: strin
     // Alasan gagal asli dari Telegram hanya ada di sini — tanpa log ini,
     // laporan "tidak bisa nyebar ke grup X" mustahil didiagnosis dari server.
     req.log.warn({ buyerId: buyer.id, executor: "BUYER", group, error: failed }, "Kirim broadcast gagal");
-    await appendActivity(buyer.id, { kind: "BROADCAST", status: "failed", label: `Gagal di @${group}`, at: now() });
+    await appendActivity(buyer.id, { kind: "BROADCAST", executor: "BUYER", status: "failed", label: `Gagal di @${group}`, at: now() });
     const target = store.lpmTargets.find((item) => item.buyerId === buyer.id && targetExecutor(item) === "BUYER" && item.username.toLowerCase() === group.toLowerCase());
     if (/CHAT_WRITE_FORBIDDEN|USER_BANNED_IN_CHANNEL|USER_RESTRICTED/i.test(failed)) { if (target) { target.status = "UNAVAILABLE"; target.note = "Akun lo tidak bisa mengirim"; target.updatedAt = now(); } sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Akun lo tidak bisa mengirim di grup ini. Periksa aturan atau pembatasan akun."); }
     else if (/CHAT_FORWARDS_RESTRICTED/i.test(failed)) sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, "Post sumber tidak mengizinkan forward. Gunakan post lain.");
     else sendBuyerAlert(store, buyer.id, `Info Auto Sebar · @${group}`, `Kiriman gagal: ${failed.replace(/_/g, " ").slice(0, 160)}`);
-  } else { const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; await appendActivity(buyer.id, { kind: "BROADCAST", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
+  } else { const link = Number.isInteger(messageId) && messageId > 0 ? `https://t.me/${group}/${messageId}` : undefined; await appendActivity(buyer.id, { kind: "BROADCAST", executor: "BUYER", status: "sent", label: `Terkirim di @${group}`, link, at: now() }); }
   cleanup(store); await save(store); const runtime = await loadSendRuntime(buyer.id, "BUYER"); return { ok: true, nextSendAt: runtime.nextSendAt };
 });
 
@@ -1040,7 +1133,7 @@ app.get<{ Querystring: { buyerId?: string } }>("/api/internal/comment-monitor", 
 });
 
 app.get<{ Querystring: { workerId?: string } }>("/api/internal/worker-owner", { preHandler: lpmAdapterOnly }, async (req, reply) => {
-  const store = await load(); const worker = store.workers.find((item) => item.id === String(req.query.workerId ?? "")); if (!worker?.buyerId) return reply.code(404).send({ error: "worker_unassigned" }); return { buyerId: worker.buyerId };
+  const workerId = String(req.query.workerId ?? ""); if (!workerRunnerAuthorized(req, workerId)) return reply.code(409).send({ error: "worker_runner_replaced" }); const store = await load(); const worker = store.workers.find((item) => item.id === workerId); if (!worker?.buyerId) return reply.code(404).send({ error: "worker_unassigned" }); return { buyerId: worker.buyerId };
 });
 
 app.post<{ Body: { buyerId?: string; base?: string; discussion?: string; status?: CommentTargetStatus; note?: string } }>("/api/internal/comment-target-status", { preHandler: lpmAdapterOnly }, async (req, reply) => {
@@ -1090,7 +1183,7 @@ app.post<{ Body: { buyerId?: string; status?: UserbotAccountStatus; note?: strin
 app.post<{ Body: { buyerId?: string; workerId?: string; chat?: string; type?: "MENTION" | "REPLY" | "MUTED"; text?: string; link?: string } }>("/api/internal/operational-alert", { preHandler: lpmAdapterOnly }, async (req, reply) => {
   const buyerId = String(req.body?.buyerId ?? ""); const chat = String(req.body?.chat ?? "").replace(/^@/, "").toLowerCase(); const type = req.body?.type; const store = await load(); const buyer = store.buyers.find((item) => item.id === buyerId);
   if (!buyer || !chat || !type) return reply.code(400).send({ error: "alert_invalid" });
-  const workerId = String(req.body?.workerId ?? ""); const isWorkerSource = workerId && buyer.workerId === workerId && store.lpmTargets.some((item) => item.buyerId === buyerId && targetExecutor(item) === "ADMIN" && item.username.toLowerCase() === chat);
+  const workerId = String(req.body?.workerId ?? ""); const isWorkerSource = workerId && workerRunnerAuthorized(req, workerId) && buyer.workerId === workerId && store.lpmTargets.some((item) => item.buyerId === buyerId && targetExecutor(item) === "ADMIN" && item.username.toLowerCase() === chat);
   const isUserbotBroadcastSource = workerId === buyer.id && store.lpmTargets.some((item) => item.buyerId === buyerId && targetExecutor(item) === "BUYER" && item.username.toLowerCase() === chat);
   const isCommentSource = !workerId && store.commentTargets.some((item) => item.buyerId === buyerId && (item.base.toLowerCase() === chat || item.discussion?.toLowerCase() === chat));
   if (!isWorkerSource && !isUserbotBroadcastSource && !isCommentSource) return reply.code(403).send({ error: "alert_source_invalid" });
@@ -1222,8 +1315,9 @@ app.post<{ Params: { id: string }; Body: { deleteToken?: string; error?: string 
 
 app.get("/api/admin/overview", { preHandler: adminOnly }, async () => {
   const store = await load(); if (cleanup(store)) await save(store);
-  const workerSessions = Object.keys(await readWorkerSessions());
-  return { buyers: store.buyers.map((buyer) => buyerWithEffectiveAccess(store, buyer)), entitlements: Object.fromEntries(store.buyers.map((buyer) => [buyer.id, entitlementSummary(store, buyer)])), workers: store.workers, workerSessions, broadcasts: store.broadcasts, lpmTargets: store.lpmTargets.filter((item) => item.status !== "REMOVED"), comments: store.commentConfigs, subscriptions: store.subscriptions, packages: store.packages, commerce: commerceFor(store) };
+  const sessions = await readWorkerSessions(); const workerSessions = Object.keys(sessions);
+  const workers = store.workers.map((worker) => ({ ...worker, accountStatus: effectiveWorkerAccountStatus(worker, Boolean(sessions[worker.id])), sessionReady: Boolean(sessions[worker.id]), runnerActive: workerRunners.get(worker.id)?.exitCode === null, lastSeenAt: workerHeartbeatAt.get(worker.id) ?? worker.lastSeenAt }));
+  return { buyers: store.buyers.map((buyer) => buyerWithEffectiveAccess(store, buyer)), entitlements: Object.fromEntries(store.buyers.map((buyer) => [buyer.id, entitlementSummary(store, buyer)])), workers, workerSessions, broadcasts: store.broadcasts, lpmTargets: store.lpmTargets.filter((item) => item.status !== "REMOVED"), comments: store.commentConfigs, subscriptions: store.subscriptions, packages: store.packages, commerce: commerceFor(store) };
 });
 
 app.post<{ Params: { id: string }; Body: { product?: "ADMIN_BROADCAST" | "USERBOT_PROMO"; durationDays?: number; maxGroups?: number } }>("/api/admin/buyers/:id/subscriptions", { preHandler: adminOnly }, async (req, reply) => {
@@ -1337,16 +1431,16 @@ app.post<{ Body: { label?: string; username?: string } }>("/api/admin/workers", 
   const label = String(req.body.label ?? "").trim();
   if (!label) return reply.code(400).send({ error: "Isi nama akun worker." });
   const store = await load();
-  const worker: Worker = { id: id("worker"), label, username: "", status: "AVAILABLE", buyerId: null, createdAt: now() }; store.workers.push(worker); await save(store); return { worker };
+  const worker: Worker = { id: id("worker"), label, username: "", status: "AVAILABLE", buyerId: null, accountStatus: "DISCONNECTED", createdAt: now() }; store.workers.push(worker); await save(store); return { worker };
 });
 
 async function finishWorkerLogin(login: PendingWorkerLogin, worker: Worker, store: Store) {
   const me = await login.client.getMe(); const username = "username" in me ? String(me.username ?? "") : "";
   if (!username) throw new Error("Akun Telegram ini belum memiliki username.");
   if (store.workers.some((item) => item.id !== worker.id && item.username.toLowerCase() === username.toLowerCase())) throw new Error(`@${username} sudah terdaftar sebagai worker.`);
-  worker.username = username; await save(store);
   const session = login.client.session.save(); if (!session) throw new Error("Session akun tidak bisa disimpan.");
-  await saveWorkerSession(worker.id, session); pendingWorkerLogins.delete(worker.id); await login.client.disconnect(); runnerRestartNotBefore.delete("worker:" + worker.id); startWorkerRunner(worker.id);
+  stopWorkerRunner(worker.id); await saveWorkerSession(worker.id, session); worker.username = username; worker.accountStatus = "CONNECTED"; worker.lastSeenAt = now(); delete worker.accountIssue; delete worker.cooldownUntil; await save(store);
+  pendingWorkerLogins.delete(worker.id); await login.client.disconnect(); runnerRestartNotBefore.delete("worker:" + worker.id); void reconcileRunnersSafely();
   return username;
 }
 async function clearPendingWorkerLogin(workerId: string) { const login = pendingWorkerLogins.get(workerId); pendingWorkerLogins.delete(workerId); if (login) await login.client.disconnect().catch(() => undefined); }
@@ -1380,6 +1474,10 @@ app.post<{ Params: { id: string }; Body: { password?: string } }>("/api/admin/wo
   catch (error) { return reply.code(400).send({ error: telegramReason(error) }); }
 });
 
+app.post<{ Params: { id: string } }>("/api/admin/workers/:id/login/cancel", { preHandler: adminOnly }, async (req) => {
+  await clearPendingWorkerLogin(req.params.id); return { ok: true };
+});
+
 app.delete<{ Params: { id: string } }>("/api/admin/workers/:id", { preHandler: adminOnly }, async (req, reply) => {
   const store = await load(); const worker = store.workers.find((item) => item.id === req.params.id);
   if (!worker) return reply.code(404).send({ error: "Worker tidak ditemukan." });
@@ -1388,19 +1486,38 @@ app.delete<{ Params: { id: string } }>("/api/admin/workers/:id", { preHandler: a
   store.workers = store.workers.filter((item) => item.id !== worker.id); await save(store); return { ok: true };
 });
 
-app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?: boolean; workerId?: string | null; broadcastMode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number; bases?: string; divisions?: unknown; mode?: "APPROVAL" | "AUTO" } }>("/api/admin/buyers/:id/setup", { preHandler: adminOnly }, async (req, reply) => {
+app.post<{ Params: { id: string } }>("/api/admin/workers/:id/disconnect", { preHandler: adminOnly }, async (req, reply) => {
+  const store = await load(); const worker = store.workers.find((item) => item.id === req.params.id);
+  if (!worker) return reply.code(404).send({ error: "Worker tidak ditemukan." });
+  if (worker.buyerId || workerHasPendingTargets(store.lpmTargets, worker.id)) return reply.code(409).send({ error: "Worker masih dipakai buyer. Hubungkan ulang akun atau ganti worker buyer terlebih dahulu." });
+  await clearPendingWorkerLogin(worker.id); stopWorkerRunner(worker.id); await removeWorkerSession(worker.id); worker.accountStatus = "DISCONNECTED"; delete worker.accountIssue; delete worker.lastSeenAt; delete worker.cooldownUntil; await save(store);
+  return { ok: true, worker };
+});
+
+app.post<{ Params: { id: string } }>("/api/admin/workers/:id/disable", { preHandler: adminOnly }, async (req, reply) => {
+  const store = await load(); const worker = store.workers.find((item) => item.id === req.params.id);
+  if (!worker) return reply.code(404).send({ error: "Worker tidak ditemukan." });
+  if (worker.buyerId || workerHasPendingTargets(store.lpmTargets, worker.id)) return reply.code(409).send({ error: "Worker masih dipakai buyer dan belum bisa dinonaktifkan." });
+  await clearPendingWorkerLogin(worker.id); stopWorkerRunner(worker.id); worker.status = "DISABLED"; await save(store); return { ok: true, worker };
+});
+
+app.post<{ Params: { id: string } }>("/api/admin/workers/:id/enable", { preHandler: adminOnly }, async (req, reply) => {
+  const store = await load(); const worker = store.workers.find((item) => item.id === req.params.id);
+  if (!worker) return reply.code(404).send({ error: "Worker tidak ditemukan." });
+  const sessions = await readWorkerSessions(); worker.status = worker.buyerId ? "ASSIGNED" : "AVAILABLE"; worker.accountStatus = effectiveWorkerAccountStatus(worker, Boolean(sessions[worker.id])); delete worker.cooldownUntil; await save(store); void reconcileRunnersSafely(); return { ok: true, worker };
+});
+
+app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?: boolean; workerId?: string | null; broadcastMode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[] | string; intervalMinutes?: number; bases?: string; divisions?: unknown; mode?: "APPROVAL" | "AUTO" } }>("/api/admin/buyers/:id/setup", { preHandler: adminOnly }, async (req, reply) => {
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
   if (Boolean(req.body.planBroadcast) && !hasPlanAccess(store, buyer, "BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Auto Sebar belum aktif." });
   if (Boolean(req.body.planComment) && !hasPlanAccess(store, buyer, "COMMENT")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Userbot Promosi belum aktif." });
   if (Boolean(req.body.planBroadcast)) {
-    const worker = store.workers.find((item) => item.id === req.body.workerId);
-    if (!worker || (worker.status !== "AVAILABLE" && worker.buyerId !== buyer.id)) return reply.code(409).send({ error: "Pilih worker yang tersedia untuk buyer ini." });
+    const sessions = await readWorkerSessions(); const worker = store.workers.find((item) => item.id === req.body.workerId);
+    if (!worker || !workerCanBeAssigned(worker, Boolean(worker && sessions[worker.id]), buyer.id)) return reply.code(409).send({ error: "Pilih worker yang sudah terhubung dan tersedia untuk buyer ini." });
     let content: ReturnType<typeof broadcastContent>; try { content = broadcastContent({ mode: req.body.broadcastMode, wording: req.body.wording, forwardLink: req.body.forwardLink, showForwardSource: req.body.showForwardSource }); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
     let groups: string[]; try { groups = cleanGroups(req.body.groups, maxGroupsForBuyer(store, buyer)); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
-    for (const item of store.workers) if (item.buyerId === buyer.id && item.id !== worker.id) { item.buyerId = null; item.status = "AVAILABLE"; }
-    worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
-    syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
+    assignWorkerToBroadcast(store, buyer, worker, groups);
     const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
     store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast];
   } else { buyer.broadcastActive = false; for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); } releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"); }
@@ -1411,19 +1528,20 @@ app.post<{ Params: { id: string }; Body: { planBroadcast?: boolean; planComment?
   } else { buyer.commentActive = false; store.commentConfigs = store.commentConfigs.filter((item) => item.buyerId !== buyer.id); }
   buyer.updatedAt = now(); await save(store);
   if (buyer.broadcastActive) { const current = broadcastFor(store, buyer.id, "ADMIN"); if (current) await scheduleNextSend(buyer.id, "ADMIN", current.intervalMinutes, true); }
+  void reconcileRunnersSafely();
   return { ok: true, buyer };
 });
 
 // These are deliberately separate from the legacy all-in-one setup route above.
 // Admin can now change one service without accidentally overwriting the other.
-app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[]; intervalMinutes?: number } }>("/api/admin/buyers/:id/broadcast-config", { preHandler: adminOnly }, async (req, reply) => {
+app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; mode?: "TEXT" | "FORWARD"; wording?: string; forwardLink?: string; showForwardSource?: boolean; groups?: string[] | string; intervalMinutes?: number } }>("/api/admin/buyers/:id/broadcast-config", { preHandler: adminOnly }, async (req, reply) => {
   const store = await load(); const buyer = store.buyers.find((item) => item.id === req.params.id);
   if (!buyer) return reply.code(404).send({ error: "Buyer tidak ditemukan." });
   if (!req.body.enabled) {
     buyer.broadcastActive = false; unlockBroadcast(buyer, "ADMIN");
     for (const target of store.lpmTargets.filter((item) => item.buyerId === buyer.id && targetExecutor(item) === "ADMIN" && item.desired)) { target.desired = false; target.status = "REMOVING"; target.updatedAt = now(); }
     releaseWorkerWhenGroupsCleared(store, buyer); store.broadcasts = store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN");
-    buyer.updatedAt = now(); await save(store); return { ok: true, buyer };
+    buyer.updatedAt = now(); await save(store); void reconcileRunnersSafely(); return { ok: true, buyer };
   }
   if (!hasPlanAccess(store, buyer, "BROADCAST")) return reply.code(403).send({ error: "subscription_required", reason: "Akses Auto Sebar belum aktif." });
   if (!req.body.workerId) {
@@ -1431,16 +1549,15 @@ app.put<{ Params: { id: string }; Body: { enabled?: boolean; workerId?: string; 
     return { ok: true, buyer };
   }
   try { requireBroadcastLock(buyer, "ADMIN"); } catch (error) { return reply.code(409).send({ error: "setup_locked", reason: (error as Error).message }); }
-  const worker = store.workers.find((item) => item.id === req.body.workerId);
-  if (!worker || (worker.status !== "AVAILABLE" && worker.buyerId !== buyer.id)) return reply.code(409).send({ error: "Pilih akun kerja yang tersedia." });
+  const sessions = await readWorkerSessions(); const worker = store.workers.find((item) => item.id === req.body.workerId);
+  if (!worker || !workerCanBeAssigned(worker, Boolean(worker && sessions[worker.id]), buyer.id)) return reply.code(409).send({ error: "Pilih akun kerja yang sudah terhubung dan tersedia." });
   let content: ReturnType<typeof broadcastContent>; try { content = broadcastContent(req.body ?? {}); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
   let groups: string[]; try { groups = cleanGroups(req.body.groups, maxGroupsForBuyer(store, buyer)); } catch (error) { return reply.code(400).send({ error: (error as Error).message }); }
-  for (const item of store.workers) if (item.buyerId === buyer.id && item.id !== worker.id) { item.buyerId = null; item.status = "AVAILABLE"; }
-  worker.buyerId = buyer.id; worker.status = "ASSIGNED"; delete worker.cooldownUntil; buyer.workerId = worker.id;
-  syncLpmTargets(store, buyer, worker.id, "ADMIN", groups);
+  assignWorkerToBroadcast(store, buyer, worker, groups);
   const broadcast: Broadcast = { buyerId: buyer.id, executor: "ADMIN", ...content, groups, intervalMinutes: broadcastInterval(req.body.intervalMinutes), updatedBy: "ADMIN", updatedAt: now() };
   store.broadcasts = [...store.broadcasts.filter((item) => item.buyerId !== buyer.id || broadcastExecutor(item) !== "ADMIN"), broadcast]; unlockBroadcast(buyer, "ADMIN"); buyer.updatedAt = now(); await save(store);
   if (buyer.broadcastActive) await scheduleNextSend(buyer.id, "ADMIN", broadcast.intervalMinutes, true);
+  void reconcileRunnersSafely();
   return { ok: true, buyer, broadcast };
 });
 

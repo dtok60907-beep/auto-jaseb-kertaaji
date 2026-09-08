@@ -10,8 +10,10 @@ import { loadPersistentStore, readEncryptedSessions } from "../src/database.js";
 type Job = { id: string; action: "JOIN" | "LEAVE"; username: string };
 type BroadcastJob = { buyerId: string; deliveryToken: string; group: string; wording: string; mode: "TEXT" | "FORWARD"; forward?: { channel: string; messageId: number; showSource: boolean } };
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const workerRef = String(process.argv[2] ?? "").replace(/^@/, ""); const apiId = Number(process.env.TELEGRAM_API_ID); const apiHash = process.env.TELEGRAM_API_HASH ?? ""; const sessionKey = process.env.WORKER_SESSION_KEY ?? ""; const adapterToken = process.env.LPM_ADAPTER_TOKEN ?? ""; const baseUrl = (process.env.LPM_API_URL ?? `http://127.0.0.1:${process.env.PORT ?? 8787}`).replace(/\/$/, "");
+const workerRef = String(process.argv[2] ?? "").replace(/^@/, ""); const instanceId = String(process.env.WORKER_RUNNER_INSTANCE ?? "manual"); const apiId = Number(process.env.TELEGRAM_API_ID); const apiHash = process.env.TELEGRAM_API_HASH ?? ""; const sessionKey = process.env.WORKER_SESSION_KEY ?? ""; const adapterToken = process.env.LPM_ADAPTER_TOKEN ?? ""; const baseUrl = (process.env.LPM_API_URL ?? `http://127.0.0.1:${process.env.PORT ?? 8787}`).replace(/\/$/, "");
 if (!workerRef || !Number.isInteger(apiId) || !apiHash || sessionKey.length < 24 || !adapterToken) throw new Error("@username worker dan konfigurasi Telegram/LPM belum lengkap.");
+const emit = (event: string, details: Record<string, unknown> = {}) => console.log(JSON.stringify({ event, workerId: workerRef, ...details }));
+const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)); const headers = { "x-lpm-adapter-token": adapterToken, "x-worker-runner-instance": instanceId, "content-type": "application/json" };
 const store = await loadPersistentStore<{ workers?: { id: string; username: string }[] }>(join(root, "data/store.json"), {});
 const worker = store.workers?.find((item) => item.id === workerRef || item.username.toLowerCase() === workerRef.toLowerCase());
 if (!worker) throw new Error("Worker tidak ditemukan.");
@@ -21,9 +23,9 @@ function decrypt(value: string) { const [iv, tag, content] = value.split("."); c
 const sessions = await readEncryptedSessions("worker", join(root, "data/worker-sessions.json"));
 if (!sessions[workerId]) throw new Error("Session worker belum ada. Jalankan npm run worker:login -- <worker-id>.");
 const client = new TelegramClient(new StringSession(decrypt(sessions[workerId])), apiId, apiHash, { connectionRetries: 5 });
-const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)); const headers = { "x-lpm-adapter-token": adapterToken, "content-type": "application/json" };
+async function accountStatus(status: "CONNECTED" | "HEARTBEAT" | "RECONNECT_REQUIRED", issue?: string) { const response = await fetch(`${baseUrl}/api/internal/worker-account-status`, { method: "POST", headers, body: JSON.stringify({ workerId, instanceId, status, issue }) }); if (!response.ok) throw new Error(`Worker status HTTP ${response.status}`); }
 async function report(id: string, status: "READY" | "PENDING_APPROVAL" | "UNAVAILABLE" | "REMOVED", note?: string) { await fetch(`${baseUrl}/api/internal/lpm-targets/${id}/result`, { method: "POST", headers, body: JSON.stringify({ workerId, status, note }) }); }
-async function reportBroadcast(job: BroadcastJob, result: { messageId?: number; error?: string }) { await fetch(`${baseUrl}/api/internal/broadcast-jobs/${job.buyerId}/result`, { method: "POST", headers, body: JSON.stringify({ deliveryToken: job.deliveryToken, group: job.group, ...result }) }); }
+async function reportBroadcast(job: BroadcastJob, result: { messageId?: number; error?: string }) { await fetch(`${baseUrl}/api/internal/broadcast-jobs/${job.buyerId}/result`, { method: "POST", headers, body: JSON.stringify({ deliveryToken: job.deliveryToken, workerId, group: job.group, ...result }) }); }
 async function alert(buyerId: string, chat: string, type: "MENTION" | "REPLY", text: string, messageId: number) { await fetch(`${baseUrl}/api/internal/operational-alert`, { method: "POST", headers, body: JSON.stringify({ buyerId, workerId, chat, type, text, link: `https://t.me/${chat}/${messageId}` }) }); }
 function joinStatus(error: unknown): "PENDING_APPROVAL" | "READY" | "UNAVAILABLE" { const message = String((error as Error).message ?? error); if (message.includes("INVITE_REQUEST_SENT")) return "PENDING_APPROVAL"; if (message.includes("USER_ALREADY_PARTICIPANT")) return "READY"; return "UNAVAILABLE"; }
 // Error level-session bukan urusan grup: melaporkannya sebagai UNAVAILABLE akan
@@ -31,8 +33,10 @@ function joinStatus(error: unknown): "PENDING_APPROVAL" | "READY" | "UNAVAILABLE
 // mati, hentikan runner; target dibiarkan CONNECTING agar dicoba ulang nanti.
 // Frasa "authorization key" menangkap bentuk kalimat Telegram tanpa kode yang
 // terbukti muncul di produksi saat key PFS kadaluarsa.
-const sessionFatal = (error: unknown) => /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|CONCURRENT USAGE|authorization key/i.test(String((error as Error).message ?? error));
-let sessionDead = false;
+const sessionFatal = (error: unknown) => /AUTH_KEY|SESSION_REVOKED|SESSION_EXPIRED|USER_DEACTIVATED|CONCURRENT USAGE|authorization key|session worker sudah tidak aktif|login ulang/i.test(String((error as Error).message ?? error));
+const runnerReplaced = (error: unknown) => /Worker status HTTP 409/i.test(String((error as Error).message ?? error));
+let sessionDead: unknown; let lastPollError = ""; let lastPollErrorAt = 0; let lastHeartbeatAt = 0; const leaveRetryNotBefore = new Map<string, number>();
+function reportPollError(error: unknown) { const detail = String((error as Error).message ?? error).slice(0, 180); if (detail === lastPollError && Date.now() - lastPollErrorAt < 60_000) return; lastPollError = detail; lastPollErrorAt = Date.now(); emit("worker-poll-error", { error: detail }); }
 async function forwardSourcePost(job: BroadcastJob) {
   if (!job.forward) throw new Error("Sumber forward belum lengkap.");
   const source = "@" + job.forward.channel;
@@ -75,13 +79,74 @@ async function forwardSourcePost(job: BroadcastJob) {
   return { messageId: sentIds.length ? Math.min(...sentIds) : undefined };
 }
 try {
-  await client.connect(); if (!await client.checkAuthorization()) throw new Error("Session worker sudah tidak aktif. Login ulang.");
-  client.addEventHandler(async (event: any) => { try { const chat = await event.getChat(); const username = String(chat?.username ?? ""); const message = event.message; if (!username || (!message?.mentioned && !message?.replyTo?.replyToMsgId)) return; const replyId = message?.replyTo?.replyToMsgId; const replies: any = replyId ? await client.getMessages(await event.getInputChat(), { ids: replyId }) : []; const isReplyToWorker = Boolean(replies?.[0]?.out); if (!message?.mentioned && !isReplyToWorker) return; const owner = await fetch(`${baseUrl}/api/internal/worker-owner?workerId=${encodeURIComponent(workerId)}`, { headers }); const payload = await owner.json() as { buyerId?: string }; if (!owner.ok || !payload.buyerId) return; await alert(payload.buyerId, username, message?.mentioned ? "MENTION" : "REPLY", String(message?.message ?? ""), Number(message?.id ?? 0)); } catch {} }, new NewMessage({ incoming: true }));
-  for (;;) { try { const response = await fetch(`${baseUrl}/api/internal/lpm-jobs?workerId=${encodeURIComponent(workerId)}`, { headers }); if (!response.ok) { await pause(5_000); continue; } const payload = await response.json() as { jobs?: Job[] };
-    for (const job of payload.jobs ?? []) { try { const confirmation = await fetch(`${baseUrl}/api/internal/lpm-targets/${job.id}/confirm`, { method: "POST", headers, body: JSON.stringify({ workerId, action: job.action }) }); const allowed = await confirmation.json() as { execute?: boolean }; if (!confirmation.ok || !allowed.execute) continue; if (job.action === "JOIN") { await client.joinChannel("@" + job.username); await report(job.id, "READY"); } else { await client.leaveChannel("@" + job.username); await report(job.id, "REMOVED"); } } catch (error) { if (sessionFatal(error)) { sessionDead = true; break; } await report(job.id, job.action === "JOIN" ? joinStatus(error) : "REMOVED", String((error as Error).message ?? error).slice(0, 160)); } if (sessionDead) break; await pause(2500); }
-    if (sessionDead) break;
-    const broadcastResponse = await fetch(`${baseUrl}/api/internal/broadcast-jobs?workerId=${encodeURIComponent(workerId)}`, { headers }); if (!broadcastResponse.ok) { await pause(5_000); continue; } const broadcastPayload = await broadcastResponse.json() as { jobs?: BroadcastJob[] };
-    for (const job of broadcastPayload.jobs ?? []) { try { const confirmation = await fetch(`${baseUrl}/api/internal/broadcast-jobs/${job.buyerId}/confirm`, { method: "POST", headers, body: JSON.stringify({ deliveryToken: job.deliveryToken, workerId, group: job.group }) }); const allowed = await confirmation.json() as { send?: boolean }; if (!confirmation.ok || !allowed.send) continue; if (job.mode === "FORWARD") { const result = await forwardSourcePost(job); await reportBroadcast(job, result); } else { const message = await client.sendMessage("@" + job.group, { message: job.wording }); if (!message) throw new Error("Pesan tidak bisa dikirim."); await reportBroadcast(job, { messageId: message.id }); } } catch (error) { if (sessionFatal(error)) { sessionDead = true; break; } await reportBroadcast(job, { error: String((error as Error).message ?? error).slice(0, 160) }); } if (sessionDead) break; await pause(2500); }
-    } catch {} if (sessionDead) break; await pause(5_000);
+  await client.connect();
+  if (!await client.checkAuthorization()) throw new Error("Session worker sudah tidak aktif. Login ulang.");
+  await accountStatus("CONNECTED"); emit("worker-connected"); lastHeartbeatAt = Date.now();
+  client.addEventHandler(async (event: any) => {
+    try {
+      const chat = await event.getChat(); const username = String(chat?.username ?? ""); const message = event.message;
+      if (!username || (!message?.mentioned && !message?.replyTo?.replyToMsgId)) return;
+      const replyId = message?.replyTo?.replyToMsgId; const replies: any = replyId ? await client.getMessages(await event.getInputChat(), { ids: replyId }) : [];
+      const isReplyToWorker = Boolean(replies?.[0]?.out); if (!message?.mentioned && !isReplyToWorker) return;
+      const owner = await fetch(`${baseUrl}/api/internal/worker-owner?workerId=${encodeURIComponent(workerId)}`, { headers }); const payload = await owner.json() as { buyerId?: string };
+      if (!owner.ok || !payload.buyerId) return;
+      await alert(payload.buyerId, username, message?.mentioned ? "MENTION" : "REPLY", String(message?.message ?? ""), Number(message?.id ?? 0));
+    } catch (error) { reportPollError(error); }
+  }, new NewMessage({ incoming: true }));
+
+  for (;;) {
+    try {
+      if (Date.now() - lastHeartbeatAt >= 30_000) { await accountStatus("HEARTBEAT"); emit("worker-heartbeat"); lastHeartbeatAt = Date.now(); }
+      const response = await fetch(`${baseUrl}/api/internal/lpm-jobs?workerId=${encodeURIComponent(workerId)}`, { headers });
+      if (!response.ok) throw new Error(`LPM jobs HTTP ${response.status}`);
+      const payload = await response.json() as { jobs?: Job[] };
+      for (const job of payload.jobs ?? []) {
+        if (job.action === "LEAVE" && Date.now() < (leaveRetryNotBefore.get(job.id) ?? 0)) continue;
+        try {
+          const confirmation = await fetch(`${baseUrl}/api/internal/lpm-targets/${job.id}/confirm`, { method: "POST", headers, body: JSON.stringify({ workerId, action: job.action }) }); const allowed = await confirmation.json() as { execute?: boolean };
+          if (!confirmation.ok || !allowed.execute) continue;
+          if (job.action === "JOIN") { await client.joinChannel("@" + job.username); await report(job.id, "READY"); }
+          else { await client.leaveChannel("@" + job.username); leaveRetryNotBefore.delete(job.id); await report(job.id, "REMOVED"); }
+        } catch (error) {
+          if (sessionFatal(error)) { sessionDead = error; break; }
+          const detail = String((error as Error).message ?? error).slice(0, 160);
+          if (job.action === "JOIN") await report(job.id, joinStatus(error), detail);
+          else if (/USER_NOT_PARTICIPANT/i.test(detail)) { leaveRetryNotBefore.delete(job.id); await report(job.id, "REMOVED", detail); }
+          else { leaveRetryNotBefore.set(job.id, Date.now() + 60_000); reportPollError(new Error(`Leave @${job.username} belum berhasil: ${detail}`)); }
+        }
+        if (sessionDead) break; await pause(2500);
+      }
+      if (sessionDead) throw sessionDead;
+
+      const broadcastResponse = await fetch(`${baseUrl}/api/internal/broadcast-jobs?workerId=${encodeURIComponent(workerId)}`, { headers });
+      if (!broadcastResponse.ok) throw new Error(`Broadcast jobs HTTP ${broadcastResponse.status}`);
+      const broadcastPayload = await broadcastResponse.json() as { jobs?: BroadcastJob[] };
+      for (const job of broadcastPayload.jobs ?? []) {
+        try {
+          const confirmation = await fetch(`${baseUrl}/api/internal/broadcast-jobs/${job.buyerId}/confirm`, { method: "POST", headers, body: JSON.stringify({ deliveryToken: job.deliveryToken, workerId, group: job.group }) }); const allowed = await confirmation.json() as { send?: boolean };
+          if (!confirmation.ok || !allowed.send) continue;
+          if (job.mode === "FORWARD") { const result = await forwardSourcePost(job); await reportBroadcast(job, result); }
+          else { const message = await client.sendMessage("@" + job.group, { message: job.wording }); if (!message) throw new Error("Pesan tidak bisa dikirim."); await reportBroadcast(job, { messageId: message.id }); }
+        } catch (error) {
+          if (sessionFatal(error)) { sessionDead = error; break; }
+          await reportBroadcast(job, { error: String((error as Error).message ?? error).slice(0, 160) });
+        }
+        if (sessionDead) break; await pause(2500);
+      }
+      if (sessionDead) throw sessionDead;
+    } catch (error) {
+      if (sessionFatal(error) || runnerReplaced(error)) throw error;
+      reportPollError(error);
+    }
+    await pause(5_000);
   }
-} finally { await client.disconnect(); }
+} catch (error) {
+  const detail = String((error as Error).message ?? error).slice(0, 220);
+  if (sessionFatal(error)) {
+    await accountStatus("RECONNECT_REQUIRED", detail).catch(() => undefined);
+    emit("worker-reconnect-required", { error: detail });
+  } else emit("worker-fatal", { error: detail });
+  console.error(detail); process.exitCode = 1;
+} finally {
+  await client.disconnect().catch(() => undefined); emit("worker-stopped");
+}
